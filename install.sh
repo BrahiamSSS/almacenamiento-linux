@@ -19,6 +19,8 @@ copiar() {
     else estado="cambia"; fi
     printf '  %-10s %s\n' "$estado" "$dst"
     [ "$estado" = igual ] && return
+    # Carpeta solo de root: no se puede comparar sin sudo; se reinstala con --apply sin contarlo como cambio.
+    if [ "$estado" = sin-acceso ]; then $APPLY && sudo install -D -m "$mode" "$src" "$dst"; return 0; fi
     cambios=$((cambios + 1))
     $APPLY || return 0
     if [ -n "$root" ]; then sudo install -D -m "$mode" "$src" "$dst"
