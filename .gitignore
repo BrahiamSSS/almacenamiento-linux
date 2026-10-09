@@ -1,0 +1,10 @@
+# Nunca subir configuración real ni secretos
+config.env
+almacenamiento.env
+*.netrc
+.netrc
+rclone.conf
+password
+*.key
+*_ed25519*
+*.json

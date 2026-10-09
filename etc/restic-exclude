@@ -1,0 +1,8 @@
+# Se regeneran o reinstalan: no se respaldan.
+/run/restic-src/home/*/.cache
+/run/restic-src/home/*/.local/share/Trash
+/run/restic-src/home/*/.gradle/caches
+/run/restic-src/home/*/.var/app/*/cache
+/run/restic-src/home/*/.npm
+/run/restic-src/root/var/lib/flatpak
+/run/restic-src/root/var/lib/systemd/coredump

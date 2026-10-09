@@ -1,0 +1,32 @@
+#!/bin/bash
+# Backup cifrado y comprimido (restic) del sistema y los teléfonos a un servidor por SFTP.
+# Lee el snapshot btrbk más reciente montado en una ruta fija para que restic
+# reconozca el backup anterior y solo suba cambios.
+#   restic-nube          backup + limpieza según RESTIC_RETENCION (+ check los domingos)
+#   restic-nube init     crea el repositorio
+#   restic-nube cmd ...  cualquier comando restic (snapshots, restore, mount...)
+# Configuración: /etc/almacenamiento.env · contraseña: /etc/restic/password (600)
+set -euo pipefail
+. /etc/almacenamiento.env
+export RESTIC_REPOSITORY="sftp:$SERVIDOR_SSH:$RESTIC_RUTA"
+export RESTIC_PASSWORD_FILE=/etc/restic/password
+export RESTIC_CACHE_DIR=/var/cache/restic
+SSH="ssh -i $SERVIDOR_LLAVE -o UserKnownHostsFile=$SERVIDOR_KNOWN_HOSTS -o BatchMode=yes"
+r() { restic -o sftp.command="$SSH $SERVIDOR_SSH -s sftp" "$@"; }
+
+[ "${1:-}" = init ] && { r init; exit; }
+[ "${1:-}" = cmd ] && { shift; r "$@"; exit; }
+
+SRC=/run/restic-src
+latest() { ls -d "$BTRBK_DESTINO/$1".2* | tail -1; }
+mkdir -p $SRC/root $SRC/home
+mount --bind -o ro "$(latest @)" $SRC/root
+mount --bind -o ro "$(latest @home)" $SRC/home
+trap 'umount $SRC/root $SRC/home' EXIT
+
+shopt -s nullglob
+r backup --compression max --exclude-caches --exclude-file /etc/restic/exclude --tag pc \
+    $SRC/root $SRC/home "$MOVIL_DIR"/*/backup-ios
+# shellcheck disable=SC2086  # RESTIC_RETENCION son varias opciones
+r forget $RESTIC_RETENCION --prune
+if [ "$(date +%u)" = 7 ]; then r check --read-data-subset 5%; fi

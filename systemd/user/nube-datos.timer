@@ -1,0 +1,9 @@
+[Unit]
+Description=Nextcloud: subir Datos y Celulares cada día
+
+[Timer]
+OnCalendar=*-*-* 02:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,7 @@
+[Unit]
+Description=Nextcloud: subir Datos y Celulares
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nube-sync datos

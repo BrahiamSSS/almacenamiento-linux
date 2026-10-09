@@ -1,0 +1,12 @@
+# Agregar a /etc/fstab (reemplaza los UUID: lsblk -o NAME,UUID,FSTYPE).
+# nofail: si el disco no está, el sistema arranca igual.
+
+# Disco de datos y backups (btrfs, compresión zstd nivel 3)
+# user_subvol_rm_allowed: movil puede borrar sus snapshots viejos sin root
+UUID=<uuid-disco-datos>    /mnt/datos     btrfs  noatime,compress=zstd:3,nofail,user_subvol_rm_allowed  0 0
+
+# Disco de VMs (btrfs sin copy-on-write: imágenes de disco grandes que se reescriben)
+UUID=<uuid-disco-vm>       /mnt/vm        btrfs  subvol=@vm,noatime,nodatacow,nofail  0 0
+
+# Raíz btrfs del disco del sistema, para que btrbk vea @ y @home
+UUID=<uuid-disco-sistema>  /mnt/btr_pool  btrfs  subvolid=5,noatime,compress=zstd:1  0 0

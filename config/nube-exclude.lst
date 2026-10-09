@@ -1,0 +1,11 @@
+# Artefactos de compilación y cachés: se regeneran, no se sincronizan.
+build/
+.gradle/
+.kotlin/
+.idea/
+node_modules/
+DerivedData/
+Pods/
+.cxx/
+*.iml
+.DS_Store

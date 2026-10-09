@@ -1,0 +1,10 @@
+#!/bin/sh
+# Guarda el estado SMART de cada disco para que `discos` lo lea sin sudo.
+dir=/var/lib/disk-health
+mkdir -p "$dir"
+smartctl --scan | cut -d' ' -f1 | while read -r dev; do
+    name=$(basename "$dev")
+    smartctl -j -a "$dev" > "$dir/$name.json.tmp"
+    mv "$dir/$name.json.tmp" "$dir/$name.json"
+done
+chmod 644 "$dir"/*.json

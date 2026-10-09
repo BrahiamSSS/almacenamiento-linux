@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""discos: salud y espacio de los discos, en español y accesible.
+
+Lee el estado SMART que guarda cada hora disk-health-dump.timer en
+/var/lib/disk-health/*.json y el espacio de cada partición montada (lsblk).
+
+Uso: discos [plain | -p | --plain] [--help] [--selftest]
+  plain       sin colores, símbolos ni barras (lectores de pantalla, logs).
+              También se activa con NO_COLOR, TERM=dumb o salida redirigida.
+Código de salida: 0 todo bien, 1 algo requiere atención, 2 algo es crítico.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+DATA = Path(os.environ.get("DISCOS_DATA", "/var/lib/disk-health"))
+OK, WARN, CRIT, INFO = 0, 1, 2, -1
+LABEL = {OK: "Bien", WARN: "Atención", CRIT: "Crítico", INFO: "Info"}
+SYMBOL = {OK: "✔", WARN: "▲", CRIT: "✖", INFO: "ℹ"}
+COLOR = {OK: "32", WARN: "33", CRIT: "31", INFO: "36"}
+
+
+# ---------- umbrales ----------
+
+def level_life(left):
+    return CRIT if left <= 10 else WARN if left <= 20 else OK
+
+
+def level_space(pct):
+    return CRIT if pct >= 90 else WARN if pct >= 80 else OK
+
+
+def level_temp(c, warn=60, crit=70):
+    return CRIT if c >= crit else WARN if c >= warn else OK
+
+
+# ---------- lectura SMART ----------
+
+SATA_LIFE = (202, 231, 177, 169)  # atributos de "vida restante" según fabricante
+SATA_ERRORS = {
+    5: "bloques reasignados",
+    187: "errores no corregibles",
+    197: "sectores pendientes",
+    198: "sectores ilegibles",
+    199: "errores de cable SATA",
+}
+
+
+def parse(smart):
+    d = {
+        "model": smart.get("model_name", "desconocido"),
+        "bytes": smart.get("user_capacity", {}).get("bytes", 0),
+        "passed": smart.get("smart_status", {}).get("passed"),
+        "temp": smart.get("temperature", {}).get("current"),
+        # Límite propio del fabricante (NVMe); si no hay, 60/70 °C genéricos.
+        "temp_crit": smart.get("temperature", {}).get("op_limit_max", 70),
+        "hours": smart.get("power_on_time", {}).get("hours"),
+        "cycles": smart.get("power_cycle_count"),
+        "errors": {},
+    }
+    nv = smart.get("nvme_smart_health_information_log")
+    if nv:
+        d.update(
+            kind="NVMe",
+            life=max(0, 100 - nv.get("percentage_used", 0)),
+            spare=nv.get("available_spare"),
+            spare_min=nv.get("available_spare_threshold"),
+            critical=nv.get("critical_warning", 0),
+            written=nv.get("data_units_written", 0) * 512000,
+            unsafe=nv.get("unsafe_shutdowns"),
+        )
+        if nv.get("media_errors"):
+            d["errors"]["datos ilegibles"] = nv["media_errors"]
+        return d
+    attrs = {a["id"]: a for a in smart.get("ata_smart_attributes", {}).get("table", [])}
+    life = next((attrs[i]["value"] for i in SATA_LIFE if i in attrs), None)
+    lbas = attrs.get(246) or attrs.get(241)
+    # La unidad va en el nombre del atributo: LBAs (512 B), _32MiB, _GiB...
+    unit = 32 * 2**20 if lbas and "32MiB" in lbas["name"] else 2**30 if lbas and "GiB" in lbas["name"] else 512
+    d.update(
+        kind="SATA",
+        life=life,
+        critical=0,
+        written=lbas["raw"]["value"] * unit if lbas else None,
+        unsafe=attrs.get(174, attrs.get(192, {})).get("raw", {}).get("value"),
+    )
+    for i, name in SATA_ERRORS.items():
+        n = attrs.get(i, {}).get("raw", {}).get("value", 0)
+        if n:
+            d["errors"][name] = n
+    return d
+
+
+def checks(d):
+    """Lista de (nivel, etiqueta, valor, explicación, barra%)"""
+    rows = []
+    if d["passed"] is False or d["critical"]:
+        rows.append((CRIT, "Estado SMART", "FALLA",
+                     "el propio disco reporta una falla: respalda y reemplázalo", None))
+    else:
+        rows.append((OK, "Estado SMART", "aprobado",
+                     "autodiagnóstico interno del disco", None))
+    if d["life"] is not None:
+        rows.append((level_life(d["life"]), "Vida útil", f"{d['life']} % restante",
+                     "desgaste por escritura; planifica cambio bajo 20 %", d["life"]))
+    if d.get("spare") is not None:
+        low = d["spare"] <= d["spare_min"]
+        rows.append((CRIT if low else OK, "Reserva", f"{d['spare']} % (mínimo {d['spare_min']} %)",
+                     "bloques de repuesto para reemplazar celdas dañadas", None))
+    if d["temp"] is not None:
+        crit = d["temp_crit"]
+        rows.append((level_temp(d["temp"], crit - 10, crit), "Temperatura", f"{d['temp']} °C",
+                     f"normal bajo {crit - 10} °C, peligroso desde {crit} °C", None))
+    if d["errors"]:
+        txt = ", ".join(f"{n} {k}" for k, n in d["errors"].items())
+        rows.append((WARN, "Errores", txt, "respalda y vigila si el número sube", None))
+    else:
+        rows.append((OK, "Errores", "ninguno", "sin sectores dañados ni datos ilegibles", None))
+    if d["written"]:
+        rows.append((INFO, "Escrito total", tb(d["written"]),
+                     "datos escritos en toda su vida", None))
+    if d["hours"] is not None:
+        years = f"{d['hours'] / 8760:.1f}".replace(".", ",")
+        rows.append((INFO, "Encendido", f"{num(d['hours'])} h (≈ {years} años)",
+                     f"{num(d['cycles'])} arranques" if d["cycles"] else "", None))
+    if d["unsafe"] and d["cycles"]:
+        pct = 100 * d["unsafe"] / d["cycles"]
+        rows.append((WARN if pct >= 20 else INFO, "Apagados bruscos",
+                     f"{num(d['unsafe'])} ({pct:.0f} % de los arranques)",
+                     "cortes de luz o apagado forzado; arriesgan datos", None))
+    return rows
+
+
+# ---------- espacio ----------
+
+def disks_space():
+    """{disco: [(punto de montaje, usado, tamaño)]} desde lsblk."""
+    out = subprocess.run(
+        ["lsblk", "-J", "-b", "-o", "NAME,FSTYPE,FSUSED,FSSIZE,MOUNTPOINTS"],
+        capture_output=True, text=True, check=True).stdout
+    res = {}
+    for disk in json.loads(out)["blockdevices"]:
+        parts = []
+        for p in disk.get("children", []):
+            mps = [m for m in p.get("mountpoints") or [] if m and m != "[SWAP]"]
+            if mps and p.get("fssize"):
+                mp = "/" if "/" in mps else min(mps, key=len)
+                parts.append((mp, int(p["fsused"]), int(p["fssize"])))
+        res[disk["name"]] = parts
+    return res
+
+
+def match_disk(dev, names):
+    """smartctl usa /dev/nvme0; lsblk usa nvme0n1."""
+    b = os.path.basename(dev)
+    return next((n for n in names if n == b or n.startswith(b + "n")), b)
+
+
+# ---------- formato ----------
+
+def num(n):
+    return f"{n:,}".replace(",", ".")
+
+
+def gb(b):
+    return f"{b / 1e9:.0f} GB"
+
+
+def tb(b):
+    return f"{b / 1e12:.1f} TB".replace(".", ",")
+
+
+def ago(sec):
+    m = int(sec // 60)
+    return "hace menos de 1 min" if m < 1 else f"hace {m} min" if m < 120 else f"hace {m // 60} h"
+
+
+class Out:
+    def __init__(self, plain):
+        self.plain = plain
+        self.width = min(shutil.get_terminal_size((80, 24)).columns, 100)
+
+    def c(self, code, s):
+        return s if self.plain else f"\033[{code}m{s}\033[0m"
+
+    def tag(self, lvl):
+        if self.plain:
+            return f"[{LABEL[lvl]}]"
+        return self.c(COLOR[lvl], SYMBOL[lvl])
+
+    def bar(self, pct, good_high):
+        if self.plain or self.width < 70:
+            return ""
+        n = 20
+        fill = round(n * pct / 100)
+        lvl = level_life(pct) if good_high else level_space(pct)
+        return " " + self.c(COLOR[lvl], "█" * fill) + self.c("2", "░" * (n - fill))
+
+
+def render(o, cards, age):
+    worst = max([lvl for _, _, lvl, _ in cards] or [OK])
+    bad = [f"{name} ({', '.join(r[1].lower() for r in rows if r[0] == worst)})"
+           for name, _, lvl, rows in cards if lvl == worst and worst > OK]
+    summary = (f"{len(cards)} discos, todos en buen estado" if worst == OK
+               else f"{LABEL[worst]} en " + "; ".join(bad))
+    print(o.c("1", f"Discos: {summary}"))
+    print(o.c("2", f"Datos de salud {age}. Actualiza con: sudo systemctl start disk-health-dump"))
+    for name, header, lvl, rows in cards:
+        print()
+        if o.plain:
+            # Una frase por línea: se lee bien con lector de pantalla y en logs.
+            print(f"{LABEL[lvl]}: {header}")
+            for r_lvl, label, value, why, _ in rows:
+                print(f"  {LABEL[r_lvl]}. {label}: {value}." + (f" {why[0].upper()}{why[1:]}." if why else ""))
+            continue
+        print(f"{o.tag(lvl)} {o.c('1', LABEL[lvl] + ': ' + header)}")
+        for r_lvl, label, value, why, pct in rows:
+            word = "" if r_lvl in (OK, INFO) else f" ({LABEL[r_lvl]})"
+            bar = o.bar(pct, label == "Vida útil") if pct is not None else ""
+            print(f"  {o.tag(r_lvl)} {label:<17}" + (f"{value + word:<30}{bar}" if bar else value + word))
+            if why:
+                print(o.c("2", " " * 21 + why))
+    return worst
+
+
+def build_cards(files, space):
+    cards = []
+    for f in files:
+        d = parse(json.loads(f.read_text()))
+        dev = json.loads(f.read_text()).get("device", {}).get("name", f.stem)
+        name = match_disk(dev, space)
+        rows = checks(d)
+        for mp, used, size in space.get(name, []):
+            pct = 100 * used / size
+            rows.insert(2, (level_space(pct), "Espacio",
+                            f"{mp}: {gb(used)} de {gb(size)} ({pct:.0f} %)",
+                            f"{gb(size - used)} libres; atención desde 80 %", pct))
+        lvl = max(r[0] for r in rows)
+        mps = ", ".join(sorted((mp for mp, _, _ in space.get(name, [])), key=len)) or "sin montar"
+        header = f"{name} · {d['model']} ({d['kind']}, {gb(d['bytes'])}) · {mps}"
+        is_system = any(mp == "/" for mp, _, _ in space.get(name, []))
+        cards.append((not is_system, name, header, lvl, rows))
+    # El disco del sistema primero, luego por nombre.
+    return [c[1:] for c in sorted(cards)]
+
+
+def selftest():
+    assert level_life(87) == OK and level_life(15) == WARN and level_life(5) == CRIT
+    assert level_space(50) == OK and level_space(85) == WARN and level_space(95) == CRIT
+    assert level_temp(46) == OK and level_temp(65) == WARN and level_temp(72) == CRIT
+    assert level_temp(60, 68, 78) == OK and level_temp(70, 68, 78) == WARN
+    nv = parse({"nvme_smart_health_information_log": {
+        "percentage_used": 13, "available_spare": 100, "available_spare_threshold": 5,
+        "media_errors": 0, "critical_warning": 0, "data_units_written": 2}})
+    assert nv["life"] == 87 and nv["written"] == 1024000 and not nv["errors"]
+    sata = parse({"ata_smart_attributes": {"table": [
+        {"id": 202, "value": 99, "raw": {"value": 1}},
+        {"id": 5, "value": 100, "raw": {"value": 3}},
+        {"id": 241, "name": "Host_Writes_32MiB", "value": 100, "raw": {"value": 2}}]}})
+    assert sata["written"] == 64 * 2**20
+    assert sata["life"] == 99 and sata["errors"] == {"bloques reasignados": 3}
+    assert max(r[0] for r in checks(sata)) == WARN
+    assert match_disk("/dev/nvme1", ["nvme0n1", "nvme1n1", "sda"]) == "nvme1n1"
+    print("selftest ok")
+
+
+def main():
+    args = set(sys.argv[1:])
+    unknown = args - {"--selftest", "-h", "--help", "ayuda", "--plain", "-p", "plain"}
+    if unknown:
+        print(f"Opción desconocida: {' '.join(sorted(unknown))}\n\n{__doc__.strip()}", file=sys.stderr)
+        return 2
+    if "--selftest" in args:
+        return selftest()
+    if args & {"-h", "--help", "ayuda"}:
+        print(__doc__.strip())
+        return 0
+    plain = (args & {"--plain", "-p", "plain"} or "NO_COLOR" in os.environ
+             or os.environ.get("TERM") == "dumb" or not sys.stdout.isatty())
+    files = sorted(DATA.glob("*.json"))
+    if not files:
+        print("No hay datos de salud todavía. Instala y arranca el servicio:\n"
+              "  sudo systemctl enable --now disk-health-dump.timer", file=sys.stderr)
+        return 2
+    age = ago(time.time() - min(f.stat().st_mtime for f in files))
+    return render(Out(plain), build_cards(files, disks_space()), age)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

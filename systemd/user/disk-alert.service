@@ -1,0 +1,6 @@
+[Unit]
+Description=Alerta de capacidad de discos
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/disk-alert

@@ -1,0 +1,8 @@
+[Unit]
+Description=movil: backup automático del teléfono conectado
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/movil auto
+Nice=10
+IOSchedulingClass=idle

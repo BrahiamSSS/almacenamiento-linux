@@ -1,0 +1,6 @@
+[Unit]
+Description=Guardar estado SMART de los discos para 'discos'
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/disk-health-dump

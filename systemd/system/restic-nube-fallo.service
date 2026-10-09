@@ -1,0 +1,7 @@
+[Unit]
+Description=Avisar fallo del backup restic
+
+[Service]
+Type=oneshot
+Environment="SMARTD_SUBJECT=Falló el backup al servidor" "SMARTD_MESSAGE=Revisa: journalctl -u restic-nube"
+ExecStart=/usr/local/bin/smartd-notify

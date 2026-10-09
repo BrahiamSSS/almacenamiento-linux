@@ -1,0 +1,31 @@
+#!/bin/bash
+# Pasa el iPhone conectado por USB a la VM QEMU (macOS) o lo devuelve al host.
+# Uso: iphone-vm on|off|status   · Configuración: /etc/almacenamiento.env
+[ -r /etc/almacenamiento.env ] && . /etc/almacenamiento.env
+MON=${VM_MONITOR:-/tmp/mac-monitor.sock}
+HOSTBUS=${IPHONE_HOSTBUS:-1}
+HOSTPORT=${IPHONE_HOSTPORT:-4}
+
+mon() {
+  if [ ! -S "$MON" ]; then echo "La VM no está corriendo"; exit 1; fi
+  echo "$1" | socat - unix-connect:"$MON"
+}
+
+case "${1:-}" in
+  on)
+    systemctl --user stop movil-auto.service 2>/dev/null  # para el backup automático antes de pasar el iPhone a la VM
+    mon "device_add usb-host,id=iphone,bus=ehci.0,hostbus=$HOSTBUS,hostport=$HOSTPORT,guest-reset=false"
+    echo "iPhone → VM (bus $HOSTBUS puerto $HOSTPORT)"
+    ;;
+  off)
+    mon "device_del iphone"
+    echo "iPhone → host"
+    ;;
+  status)
+    mon "info usb"
+    ;;
+  *)
+    echo "uso: iphone-vm {on|off|status}"
+    exit 2
+    ;;
+esac

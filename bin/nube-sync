@@ -1,0 +1,37 @@
+#!/bin/bash
+# Sincroniza con Nextcloud. Configuración: /etc/almacenamiento.env
+#   nube-sync docs    $NUBE_DOCS_LOCAL <-> $NUBE_DOCS_REMOTO  (bidireccional, nextcloudcmd)
+#   nube-sync datos   $NUBE_SUBIR y vistas archivos/ de teléfonos  (solo subida, rclone copy: nunca borra)
+set -uo pipefail
+CONF=/etc/almacenamiento.env
+[ -r "$CONF" ] || { echo "Falta $CONF (ver config.env.example)" >&2; exit 2; }
+. "$CONF"
+
+fail() {
+    notify-send -u critical -i network-error "Nube: falló '$1'" "Revisa: journalctl --user -u nube-$1"
+    exit 1
+}
+
+case ${1:-} in
+    docs)
+        rclone mkdir "$NUBE_REMOTO:$NUBE_DOCS_REMOTO" || fail docs
+        nextcloudcmd -n --non-interactive --exclude "$HOME/.config/nube/exclude.lst" \
+            --path "$NUBE_DOCS_REMOTO" "$NUBE_DOCS_LOCAL" "$NUBE_URL" || fail docs
+        ;;
+    datos)
+        for par in $NUBE_SUBIR; do
+            rclone copy "${par%%:*}" "$NUBE_REMOTO:${par#*:}" --transfers 4 --stats-one-line -v || fail datos
+        done
+        if [ -n "${NUBE_CELULARES:-}" ]; then
+            for d in "$MOVIL_DIR"/*/; do
+                [ -d "$d/archivos" ] || continue
+                rclone copy "$d/archivos" "$NUBE_REMOTO:$NUBE_CELULARES/$(basename "$d")" \
+                    --transfers 4 --stats-one-line -v || fail datos
+            done
+        fi
+        ;;
+    *)
+        echo "Uso: nube-sync docs|datos" >&2
+        exit 2
+        ;;
+esac

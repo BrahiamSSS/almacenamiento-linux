@@ -1,0 +1,5 @@
+# Reemplaza la línea DEVICESCAN de /etc/smartd.conf por esta:
+#  -a todo el monitoreo · -n standby,q no despierta discos dormidos
+#  -W 4,60,70 avisa si la temperatura sube 4 °C, informa a 60 °C, crítico a 70 °C
+#  -M exec: en vez de correo, ejecuta smartd-notify (notificación de escritorio)
+DEVICESCAN -a -n standby,q -W 4,60,70 -m root -M exec /usr/local/bin/smartd-notify

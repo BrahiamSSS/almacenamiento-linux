@@ -1,0 +1,11 @@
+[Unit]
+Description=Backup restic del sistema y celulares al servidor
+After=network-online.target btrbk.service
+Wants=network-online.target
+OnFailure=restic-nube-fallo.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/restic-nube
+Nice=10
+IOSchedulingClass=idle

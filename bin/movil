@@ -1,0 +1,556 @@
+#!/usr/bin/env python3
+"""movil: backup por USB de iPhone/iPad y Android a $MOVIL_DIR (por defecto /mnt/datos/dispositivos).
+
+Uso: movil [comando] [--plain]
+  (sin comando)                   respalda todo lo conectado
+  lista (list, estado)            dispositivos, último backup y snapshots
+  restaurar <disp> [snap|ultimo]  devuelve un backup al teléfono conectado
+  configurar                      prepara el backup automático y dice qué falta
+  auto                            lo que corre solo al conectar (máx. 1 vez/24 h)
+  ayuda | --selftest
+  --plain    sin colores ni símbolos (lectores de pantalla, logs).
+             También con NO_COLOR, TERM=dumb o salida redirigida.
+
+Cada dispositivo es un subvolumen btrfs con:
+  backup-ios/<UDID>/  backup crudo de Apple (restaurable)
+  archivos/           vista legible: iOS por dominio (reflinks, 0 bytes extra,
+                      Fotos -> carrete), Android = copia de /sdcard
+Tras cada backup: snapshot read-only en .snapshots/<dispositivo>/; se guardan
+7 diarios + 4 semanales. Variable MOVIL_DIR cambia la carpeta raíz.
+"""
+import fcntl
+import os
+import plistlib
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+def _conf(var, default):
+    """Variable de /etc/almacenamiento.env (formato shell), o de entorno, o default."""
+    if var in os.environ:
+        return os.environ[var]
+    try:
+        out = subprocess.run(["bash", "-c", f'. /etc/almacenamiento.env && printf %s "${var}"'],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    return out or default
+
+
+ROOT = Path(_conf("MOVIL_DIR", "/mnt/datos/dispositivos"))
+TS = "%Y%m%dT%H%M%S"
+FICLONE = 0x40049409
+SKIP_ANDROID = ("Android/data/", "Android/obb/")  # inaccesibles sin root desde Android 11
+AUTO_EVERY = 24 * 3600
+KEEP_DAYS, KEEP_WEEKS = 7, 4
+UNIT = Path.home() / ".config/systemd/user/movil-auto.service"
+RULE_SRC = Path.home() / ".local/share/movil/90-movil.rules"
+RULE_DST = Path("/etc/udev/rules.d/90-movil.rules")
+
+UNIT_TEXT = f"""[Unit]
+Description=movil: backup automático del teléfono conectado
+
+[Service]
+Type=oneshot
+ExecStart={Path(__file__).resolve()} auto
+Nice=10
+IOSchedulingClass=idle
+"""
+RULE_TEXT = """# movil: backup automático al conectar iPhone/iPad o Android con depuración USB
+ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{PRODUCT}=="5ac/12[9a][0-9a-f]/*|5ac/8600/*", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="movil-auto.service"
+ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTERFACES}=="*:ff4201:*", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="movil-auto.service"
+"""
+
+ALIAS = {"list": "lista", "ls": "lista", "status": "lista", "estado": "lista",
+         "backup": "respaldar", "restore": "restaurar", "setup": "configurar",
+         "help": "ayuda", "-h": "ayuda", "--help": "ayuda"}
+
+OK, WARN, ERR, INFO = range(4)
+STYLE = {OK: ("✔", "32", "Bien"), WARN: ("▲", "33", "Atención"),
+         ERR: ("✖", "31", "Error"), INFO: ("ℹ", "36", "Info")}
+
+
+class Falla(Exception):
+    pass
+
+
+class Out:
+    def __init__(self, plain, notify=False):
+        self.plain, self.notifying = plain, notify
+
+    def c(self, code, s):
+        return s if self.plain else f"\033[{code}m{s}\033[0m"
+
+    def title(self, s):
+        print("\n" + self.c("1", s) if not self.plain else f"\n== {s} ==")
+
+    def say(self, lvl, msg):
+        sym, code, label = STYLE[lvl]
+        print(f"  [{label}] {msg}" if self.plain else f"  {self.c(code, sym)} {msg}", flush=True)
+
+    def dim(self, msg):
+        print(f"    {self.c('2', msg)}")
+
+    def progress(self, msg):
+        if not self.plain:
+            print(f"\r\033[K  {self.c('2', msg)}", end="", flush=True)
+
+    def clear(self):
+        if not self.plain:
+            print("\r\033[K", end="", flush=True)
+
+    def notify(self, lvl, title, body=""):
+        if self.notifying and shutil.which("notify-send"):
+            icon = {OK: "phone", WARN: "dialog-warning", ERR: "dialog-error"}.get(lvl, "phone")
+            subprocess.run(["notify-send", "-a", "movil", "-i", icon,
+                            "-u", "critical" if lvl == ERR else "normal", title, body])
+
+
+UI = Out(plain=True)
+
+
+def out(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
+
+
+def safe(name):
+    return re.sub(r"[^\w.-]+", "-", name).strip("-") or "dispositivo"
+
+
+def num(n):
+    return f"{n:,}".replace(",", ".")
+
+
+def dur(sec):
+    m, s = divmod(int(sec), 60)
+    return f"{m} min {s} s" if m else f"{s} s"
+
+
+def ago(sec):
+    m = int(sec // 60)
+    if m < 1:
+        return "hace menos de 1 min"
+    if m < 120:
+        return f"hace {m} min"
+    return f"hace {m // 60} h" if m < 48 * 60 else f"hace {m // 1440} días"
+
+
+# ---------- dispositivos y snapshots ----------
+
+def dev_dir(name, ident):
+    """Carpeta del dispositivo; se reutiliza aunque el teléfono cambie de nombre."""
+    suffix = ident[-8:]
+    return next((p for p in ROOT.glob(f"*-{suffix}") if p.is_dir()), ROOT / f"{safe(name)}-{suffix}")
+
+
+def snapshots(dev):
+    return sorted(p.name for p in (ROOT / ".snapshots" / dev.name).glob("2*"))
+
+
+def last_backup(dev):
+    snaps = snapshots(dev)
+    return time.mktime(time.strptime(snaps[-1], TS)) if snaps else None
+
+
+def keep(names):
+    """El más nuevo de cada uno de los últimos KEEP_DAYS días y KEEP_WEEKS semanas."""
+    days, weeks, kept = set(), set(), set()
+    for n in sorted(names, reverse=True):
+        d, w = n[:8], time.strftime("%G%V", time.strptime(n, TS))
+        if d not in days and len(days) < KEEP_DAYS:
+            days.add(d)
+            kept.add(n)
+        if w not in weeks and len(weeks) < KEEP_WEEKS:
+            weeks.add(w)
+            kept.add(n)
+    return kept
+
+
+def snapshot(dev):
+    dest = ROOT / ".snapshots" / dev.name / time.strftime(TS)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["btrfs", "-q", "subvolume", "snapshot", "-r", str(dev), str(dest)], check=True)
+    names = snapshots(dev)
+    for n in sorted(set(names) - keep(names)):
+        p = str(dest.parent / n)
+        subprocess.run(["btrfs", "property", "set", "-ts", p, "ro", "false"], capture_output=True)
+        if subprocess.run(["btrfs", "-q", "subvolume", "delete", p], capture_output=True).returncode:
+            subprocess.run(["btrfs", "property", "set", "-ts", p, "ro", "true"], capture_output=True)
+            UI.say(WARN, "No pude borrar snapshots viejos: falta user_subvol_rm_allowed (ver «movil configurar»)")
+            break
+    return dest.name
+
+
+def subvolume(path):
+    if not path.exists():
+        subprocess.run(["btrfs", "-q", "subvolume", "create", str(path)], check=True)
+
+
+# ---------- iOS ----------
+
+def build_view(udid_dir, view):
+    """Árbol legible desde Manifest.db, clonando (reflink) cada archivo del backup."""
+    if view.exists():
+        shutil.rmtree(view)
+    view.mkdir()
+    db = sqlite3.connect(f"file:{udid_dir / 'Manifest.db'}?mode=ro", uri=True)
+    n = 0
+    for fid, domain, rel, blob in db.execute(
+            "SELECT fileID, domain, relativePath, file FROM Files WHERE flags = 1"):
+        src = udid_dir / fid[:2] / fid
+        parts = Path(domain, rel).parts
+        if not src.exists() or ".." in parts or Path(rel).is_absolute():
+            continue
+        dst = view.joinpath(*parts)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        with open(src, "rb") as s, open(dst, "wb") as d:
+            fcntl.ioctl(d.fileno(), FICLONE, s.fileno())
+        try:  # fecha original del archivo en el teléfono
+            mtime = plistlib.loads(blob)["$objects"][1]["LastModified"]
+            os.utime(dst, (mtime, mtime))
+        except Exception:
+            pass
+        n += 1
+        if n % 500 == 0:
+            UI.progress(f"armando vista legible… {num(n)} archivos")
+    db.close()
+    UI.clear()
+    (view / "Fotos").symlink_to("CameraRollDomain/Media/DCIM")
+    return n
+
+
+def ios_info(udid):
+    info = dict(l.split(": ", 1) for l in out(["ideviceinfo", "-u", udid]).splitlines() if ": " in l)
+    name = info.get("DeviceName", "iPhone")
+    label = f"{name} ({info.get('ProductType', '?')}, iOS {info.get('ProductVersion', '?')})"
+    return label, dev_dir(name, udid)
+
+
+def backup_ios(udid, dev):
+    if subprocess.run(["idevicepair", "-u", udid, "validate"], capture_output=True).returncode:
+        if subprocess.run(["idevicepair", "-u", udid, "pair"], capture_output=True).returncode:
+            raise Falla("Desbloquea el teléfono, toca «Confiar» y vuelve a conectarlo")
+    if out(["ideviceinfo", "-u", udid, "-q", "com.apple.mobile.backup", "-k", "WillEncrypt"]) == "true":
+        raise Falla("El backup cifrado está activo. Desactívalo con: idevicebackup2 -i encryption off <contraseña>")
+    subvolume(dev)
+    (dev / "backup-ios").mkdir(exist_ok=True)
+    first = not (dev / "backup-ios" / udid / "Manifest.db").exists()
+    UI.say(INFO, "Primer backup: completo, puede tardar bastante" if first else "Backup incremental…")
+    r = subprocess.run(["idevicebackup2", "-u", udid, "backup", str(dev / "backup-ios")],
+                       stdout=subprocess.PIPE if UI.plain else None, stderr=subprocess.STDOUT, text=True)
+    if r.returncode:
+        tail = (r.stdout or "").strip().splitlines()[-3:]
+        raise Falla("idevicebackup2 falló" + (": " + " / ".join(tail) if tail else ""))
+    n = build_view(dev / "backup-ios" / udid, dev / "archivos")
+    return f"{num(n)} archivos legibles"
+
+
+# ---------- Android ----------
+
+def parse_stat(text):
+    """Líneas «tamaño mtime /sdcard/ruta» -> {ruta relativa: (tamaño, mtime)}."""
+    files = {}
+    for line in text.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) != 3 or not parts[2].startswith("/sdcard/") or not parts[0].isdigit():
+            continue
+        rel = parts[2][len("/sdcard/"):]
+        if not rel.startswith(SKIP_ANDROID):
+            files[rel] = (int(parts[0]), int(parts[1]))
+    return files
+
+
+def changed(files, base):
+    todo = []
+    for rel, (size, mtime) in files.items():
+        st = (base / rel).stat() if (base / rel).exists() else None
+        if not st or st.st_size != size or int(st.st_mtime) != mtime:
+            todo.append(rel)
+    return todo
+
+
+def android_info(serial):
+    prop = lambda k: out(["adb", "-s", serial, "shell", "getprop", k])
+    model = prop("ro.product.model") or "Android"
+    return f"{model} (Android {prop('ro.build.version.release') or '?'})", dev_dir(model, serial)
+
+
+def backup_android(serial, dev):
+    adb = ["adb", "-s", serial]
+    subvolume(dev)
+    base = dev / "archivos"
+    base.mkdir(exist_ok=True)
+    UI.progress("leyendo lista de archivos del teléfono…")
+    files = parse_stat(out(adb + ["shell", "find /sdcard/ -type f -exec stat -c '%s %Y %n' {} + 2>/dev/null"]))
+    UI.clear()
+    if not files:
+        raise Falla("No pude leer /sdcard (¿teléfono bloqueado o desconectado?)")
+    todo = changed(files, base)
+    UI.say(INFO, f"{num(len(files))} archivos en el teléfono, {num(len(todo))} nuevos o cambiados")
+    if todo:
+        with tempfile.NamedTemporaryFile("w", suffix=".lst") as lst:
+            lst.write("\n".join(todo) + "\n")
+            lst.flush()
+            subprocess.run(adb + ["push", lst.name, "/data/local/tmp/movil.lst"], check=True, capture_output=True)
+        pull = subprocess.Popen(adb + ["exec-out", "tar -cf - -C /sdcard -T /data/local/tmp/movil.lst 2>/dev/null"],
+                                stdout=subprocess.PIPE)
+        untar = subprocess.Popen(["tar", "-xvf", "-", "-C", str(base)], stdin=pull.stdout,
+                                 stdout=subprocess.PIPE, text=True)
+        pull.stdout.close()
+        for i, _ in enumerate(untar.stdout, 1):
+            UI.progress(f"copiando {num(i)}/{num(len(todo))} ({i * 100 // len(todo)} %)")
+        untar.wait()
+        pull.wait()
+        UI.clear()
+        subprocess.run(adb + ["shell", "rm", "-f", "/data/local/tmp/movil.lst"])
+        missing = len(changed({r: files[r] for r in todo}, base))
+        if missing:
+            UI.say(WARN, f"{num(missing)} archivos no se copiaron (permisos o cambiaron durante la copia)")
+    return f"{num(len(todo))} archivos copiados"
+
+
+# ---------- comandos ----------
+
+def connected(wait=0):
+    """[(tipo, id, etiqueta, carpeta)] de lo conectado; espera hasta `wait` s."""
+    deadline = time.time() + wait
+    while True:
+        ios = out(["idevice_id", "-l"]).split()
+        android, unauth = [], []
+        for line in out(["adb", "devices"]).splitlines()[1:]:
+            serial, _, state = line.partition("\t")
+            if serial:
+                (android if state == "device" else unauth).append(serial)
+        if ios or android or time.time() >= deadline:
+            break
+        time.sleep(2)
+    for s in unauth:
+        UI.say(WARN, f"Android {s}: acepta «Depuración USB» en la pantalla del teléfono")
+    return ([("ios", u, *ios_info(u)) for u in ios] +
+            [("android", s, *android_info(s)) for s in android])
+
+
+def lock():
+    f = open(ROOT / ".movil.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return None
+    return f
+
+
+def run_one(kind, ident, label, dev):
+    UI.title(f"{'iOS' if kind == 'ios' else 'Android'}: {label}")
+    UI.dim(str(dev))
+    UI.notify(INFO, f"Respaldando {label}", "No desconectes el teléfono")
+    t0 = time.time()
+    try:
+        summary = (backup_ios if kind == "ios" else backup_android)(ident, dev)
+        snap = snapshot(dev)
+    except (Falla, subprocess.CalledProcessError) as e:
+        UI.clear()
+        UI.say(ERR, str(e))
+        UI.notify(ERR, f"Backup de {label} falló", str(e))
+        return False
+    UI.say(OK, f"Listo en {dur(time.time() - t0)}: {summary}")
+    UI.dim(f"snapshot {snap} · {dev / 'archivos'}")
+    UI.notify(OK, f"Backup de {label} listo", f"{summary} en {dur(time.time() - t0)}")
+    return True
+
+
+def respaldar(auto=False):
+    held = lock()
+    if not held:
+        UI.say(WARN, "Ya hay un backup en curso")
+        return 1
+    devs = connected(wait=30 if auto else 0)
+    if not devs:
+        UI.say(WARN, "No hay teléfonos conectados")
+        UI.dim("¿iPhone pasado a la VM? → iphone-vm off · ¿Android sin depuración USB?")
+        return 1
+    results = []
+    for kind, ident, label, dev in devs:
+        last = last_backup(dev)
+        if auto and last and time.time() - last < AUTO_EVERY:
+            UI.say(INFO, f"{label}: último backup {ago(time.time() - last)}, se omite")
+            continue
+        results.append(run_one(kind, ident, label, dev))
+    return 0 if all(results) else 1
+
+
+def lista():
+    devs = sorted(p for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith("."))
+    if not devs:
+        UI.say(INFO, "Aún no hay backups. Conecta un teléfono y corre «movil»")
+        return 0
+    for dev in devs:
+        kind = "iOS" if (dev / "backup-ios").exists() else "Android"
+        last, snaps = last_backup(dev), snapshots(dev)
+        UI.title(f"{dev.name}  ({kind})")
+        if last is None:
+            UI.say(WARN, "Sin snapshots (backup incompleto)")
+        else:
+            age = time.time() - last
+            UI.say(OK if age < 7 * 86400 else WARN if age < 30 * 86400 else ERR, f"Último backup {ago(age)}")
+            UI.dim(f"{len(snaps)} snapshots: {snaps[0]} … {snaps[-1]}" if len(snaps) > 1 else f"snapshot {snaps[0]}")
+        UI.dim(str(dev / "archivos"))
+    return 0
+
+
+def restaurar(name, snap=None):
+    base = ROOT / ".snapshots" / name
+    if snap in ("ultimo", "último"):
+        snap = (snapshots(ROOT / name) or [None])[-1]
+    src = base / snap if snap else ROOT / name
+    if not src.exists():
+        UI.say(ERR, f"No existe {src}")
+        if base.exists():
+            UI.dim("snapshots: " + ", ".join(snapshots(ROOT / name)))
+        else:
+            UI.dim("dispositivos: " + ", ".join(p.name for p in ROOT.iterdir() if not p.name.startswith(".")))
+        return 1
+    devs = connected()
+    want = "ios" if (src / "backup-ios").exists() else "android"
+    targets = [d for d in devs if d[0] == want]
+    if len(targets) != 1:
+        UI.say(ERR, "Conecta exactamente un " + ("iPhone/iPad" if want == "ios" else "Android con depuración USB"))
+        return 1
+    _, ident, label, _ = targets[0]
+    if want == "ios":
+        source_udid = next((src / "backup-ios").iterdir()).name
+        cmd = ["idevicebackup2", "-u", ident, "-s", source_udid, "restore", "--system", "--settings",
+               str(src / "backup-ios")]
+        UI.say(WARN, "Apaga «Buscar mi iPhone» antes; el teléfono se reiniciará al terminar")
+    else:
+        cmd = ["adb", "-s", ident, "push", "--sync", *map(str, (src / "archivos").iterdir()), "/sdcard/"]
+    UI.say(INFO, f"Origen: {src}")
+    UI.say(INFO, f"Destino: {label}")
+    if input("  Esto escribe sobre el teléfono. ¿Seguir? [s/N] ").strip().lower() != "s":
+        UI.say(INFO, "Cancelado")
+        return 1
+    return subprocess.run(cmd).returncode
+
+
+def configurar():
+    UNIT.parent.mkdir(parents=True, exist_ok=True)
+    UNIT.write_text(UNIT_TEXT)
+    subprocess.run(["systemctl", "--user", "daemon-reload"])
+    RULE_SRC.parent.mkdir(parents=True, exist_ok=True)
+    RULE_SRC.write_text(RULE_TEXT)
+    opts = out(["findmnt", "-no", "OPTIONS", "-T", str(ROOT.parent)])
+    mnt = out(["findmnt", "-no", "TARGET", "-T", str(ROOT.parent)])
+    checks = [
+        (ROOT.is_dir() and os.access(ROOT, os.W_OK), f"Carpeta {ROOT}",
+         f"sudo install -d -o $USER -g $USER {ROOT}"),
+        (True, f"Servicio de usuario {UNIT.name}", None),
+        (RULE_DST.exists() and RULE_DST.read_text() == RULE_TEXT, "Regla udev (backup al conectar)",
+         f"sudo install -m644 {RULE_SRC} {RULE_DST} && sudo udevadm control --reload"),
+        ("user_subvol_rm_allowed" in opts, "Borrado de snapshots viejos (user_subvol_rm_allowed)",
+         rf"sudo sed -i 's|^\(\S\+\s\+{mnt}\s\+btrfs\s\+\S\+\)|\1,user_subvol_rm_allowed|' /etc/fstab"
+         f" && sudo mount -o remount,user_subvol_rm_allowed {mnt}"),
+    ] + [(bool(shutil.which(t)), f"Programa {t}", None)
+         for t in ("idevicebackup2", "adb", "btrfs", "notify-send")]
+    UI.title("Configuración de movil")
+    pending = []
+    for ok, what, fix in checks:
+        UI.say(OK if ok else ERR, what)
+        if not ok and fix:
+            pending.append(fix)
+    if pending:
+        UI.title("Falta correr (necesita root)")
+        for fix in pending:
+            print(f"  {fix}")
+        return 1
+    UI.say(OK, "Todo listo: al conectar un teléfono se respalda solo (máx. 1 vez cada 24 h)")
+    UI.dim("Android: solo si la depuración USB queda activa en el teléfono")
+    return 0
+
+
+def selftest():
+    global UI
+    UI = Out(plain=True)
+    with tempfile.TemporaryDirectory(dir=Path.home()) as tmp:  # /home es btrfs: reflink real
+        udid_dir = Path(tmp, "backup", "UDID")
+        (udid_dir / "ab").mkdir(parents=True)
+        Path(udid_dir, "ab", "ab01").write_bytes(b"foto")
+        db = sqlite3.connect(udid_dir / "Manifest.db")
+        db.execute("CREATE TABLE Files (fileID, domain, relativePath, flags, file)")
+        meta = plistlib.dumps({"$objects": ["$null", {"LastModified": 1600000000}]}, fmt=plistlib.FMT_BINARY)
+        db.executemany("INSERT INTO Files VALUES (?,?,?,?,?)", [
+            ("ab01", "CameraRollDomain", "Media/DCIM/100APPLE/IMG_0001.HEIC", 1, meta),
+            ("ab02", "CameraRollDomain", "Media/DCIM", 2, None),                  # carpeta
+            ("ab03", "HomeDomain", "../../escape", 1, None)])                     # ruta maliciosa
+        db.commit()
+        db.close()
+        view = Path(tmp, "archivos")
+        assert build_view(udid_dir, view) == 1
+        img = view / "Fotos/100APPLE/IMG_0001.HEIC"
+        assert img.read_bytes() == b"foto"
+        assert img.stat().st_ino != (udid_dir / "ab/ab01").stat().st_ino
+        assert int(img.stat().st_mtime) == 1600000000
+        assert not Path(tmp, "escape").exists()
+
+        files = parse_stat("5 100 /sdcard/DCIM/a b.jpg\n3 7 /sdcard/Android/data/x\nfind: basura\n")
+        assert files == {"DCIM/a b.jpg": (5, 100)}
+        base = Path(tmp, "sd")
+        (base / "DCIM").mkdir(parents=True)
+        (base / "DCIM/a b.jpg").write_bytes(b"12345")
+        assert changed(files, base) == ["DCIM/a b.jpg"]
+        os.utime(base / "DCIM/a b.jpg", (100, 100))
+        assert changed(files, base) == []
+
+    # 2 snapshots/día durante 60 días: 7 diarios + semanales más viejos
+    t0 = time.mktime((2026, 10, 7, 12, 0, 0, 0, 0, -1))
+    names = [time.strftime(TS, time.localtime(t0 - h * 43200)) for h in range(120)]
+    kept = keep(names)
+    assert names[0] in kept and names[1] not in kept          # el más nuevo del día, no el otro
+    assert len({n[:8] for n in kept}) == len(kept)            # máx. uno por día
+    assert 7 <= len(kept) <= 7 + KEEP_WEEKS
+    assert min(kept) >= time.strftime(TS, time.localtime(t0 - 35 * 86400))
+    assert ago(90) == "hace 1 min" and dur(75) == "1 min 15 s"
+    print("selftest ok")
+    return 0
+
+
+def main(argv):
+    global UI
+    args = [a for a in argv if a not in ("--plain", "-p", "plain")]
+    plain = (len(args) != len(argv) or "NO_COLOR" in os.environ
+             or os.environ.get("TERM") == "dumb" or not sys.stdout.isatty())
+    cmd = ALIAS.get(args[0], args[0]) if args else "respaldar"
+    UI = Out(plain, notify=cmd == "auto")
+    if cmd == "--selftest":
+        return selftest()
+    if cmd == "ayuda":
+        print(__doc__)
+        return 0
+    if cmd == "configurar":
+        return configurar()
+    if not ROOT.is_dir():
+        UI.say(ERR, f"Falta {ROOT}. Corre «movil configurar»")
+        return 1
+    if cmd in ("respaldar", "auto") and len(args) <= 1:
+        return respaldar(auto=cmd == "auto")
+    if cmd == "lista":
+        return lista()
+    if cmd == "restaurar" and len(args) in (2, 3):
+        return restaurar(*args[1:])
+    if cmd == "restaurar":
+        UI.say(ERR, "Uso: movil restaurar <dispositivo> [snapshot|ultimo]  (nombres en «movil lista»)")
+    else:
+        UI.say(ERR, f"Comando desconocido: «{args[0]}»")
+        UI.dim("Comandos: lista, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        print("\n  Interrumpido. El próximo backup continúa donde quedó.")
+        sys.exit(130)
