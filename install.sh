@@ -13,7 +13,7 @@ cambios=0
 copiar() {
     local src=$1 dst=$2 mode=$3 root=${4:-}
     local estado
-    if [ ! -r "$(dirname "$dst")" ]; then estado="sin-acceso"   # carpeta solo de root: se instala igual con --apply
+    if [ -d "$(dirname "$dst")" ] && [ ! -r "$(dirname "$dst")" ]; then estado="sin-acceso"   # carpeta solo de root: se instala igual con --apply
     elif [ ! -e "$dst" ]; then estado="nuevo"
     elif cmp -s "$src" "$dst"; then estado="igual"
     else estado="cambia"; fi
