@@ -36,13 +36,20 @@ Timer: `disk-alert.timer` (usuario), 10 min después de arrancar y cada 6 h.
 Backup por USB de iPhone/iPad (libimobiledevice) y Android (adb). Ver [movil.md](movil.md).
 
 ```
-movil                          respalda todo lo conectado
+movil                          respalda todo lo conectado (menos lo excluido)
 movil lista                    dispositivos, último backup, snapshots
+movil politica                 qué pasa al conectar cada dispositivo
+movil politica <disp> preguntar|siempre|nunca
 movil restaurar <disp> [snap]  devuelve un backup al teléfono
-movil configurar               revisa dependencias y prepara el modo automático
-movil auto                     lo que ejecuta udev al conectar (máx. 1 vez cada 24 h)
+movil configurar               revisa dependencias y prepara el aviso al conectar
+movil auto                     lo que ejecuta udev al conectar: pregunta con un aviso
 movil --selftest
 ```
+
+- **Al conectar** muestra un aviso con botones (Respaldar / Siempre / Ahora no / Nunca) y
+  recuerda «Siempre» y «Nunca» por dispositivo en `~/.config/movil/dispositivos.json`.
+- **Variables**: `MOVIL_DIR` (carpeta raíz) y `MOVIL_AUTO_HORAS` (horas mínimas entre
+  backups al conectar, 24 por defecto).
 
 ## iphone-vm
 

@@ -18,7 +18,10 @@ y el repo no se desincronizan. Lo específico de la máquina va en `/etc/almacen
 | Cambiar la retención de btrbk | `/etc/btrbk/btrbk.conf` | `target_preserve` |
 | Cambiar horarios | `systemd/*/*.timer` | `OnCalendar=` (ver `man systemd.time`); después `systemctl daemon-reload` |
 | Cambiar de servidor | `/etc/almacenamiento.env` | `SERVIDOR_SSH`, `RESTIC_RUTA`, `NUBE_URL`; `sudo restic-nube init` en el nuevo; nuevo remoto rclone y `.netrc` |
-| Respaldar otro teléfono | — | Conéctalo: `movil` lo detecta y crea su subvolumen |
+| Respaldar otro teléfono | — | Conéctalo: `movil` lo detecta, pregunta y crea su subvolumen |
+| Que un teléfono se respalde sin preguntar, o excluirlo | — | `movil politica <disp> siempre` / `nunca` (`preguntar` lo deshace) |
+| Cambiar las 24 h entre backups al conectar | `/etc/almacenamiento.env` | `MOVIL_AUTO_HORAS=12` |
+| Cambiar cuánto espera el aviso o la pausa tras «Ahora no» | `bin/movil` | Constantes `ASK_WAIT` (120 s) y `ASK_PAUSE` (600 s) |
 | Cambiar la carpeta de los teléfonos | `/etc/almacenamiento.env` | `MOVIL_DIR`; mueve los subvolúmenes existentes con `btrfs subvolume snapshot` + borrar |
 | Notificar a otro usuario | `/etc/almacenamiento.env` | `NOTIFY_UID` |
 | Agregar un disco nuevo | [arquitectura.md](arquitectura.md) + [replicar.md](replicar.md#2-discos-y-montajes) | Asígnale un rol, agrégalo a fstab con `nofail` y a `MONTAJES_VIGILADOS` |
@@ -30,6 +33,7 @@ bash -n bin/<script>                 # sintaxis
 discos --selftest; movil --selftest   # pruebas internas
 DISCOS_DATA=/tmp/smart discos plain   # discos con datos SMART de prueba
 disk-alert 1                          # forzar avisos
+MOVIL_AUTO_HORAS=0 movil auto         # ver el aviso de movil aunque el backup sea reciente
 sudo btrbk dryrun
 sudo restic-nube cmd backup --dry-run /etc   # restic sin escribir
 ./install.sh                          # qué cambiaría

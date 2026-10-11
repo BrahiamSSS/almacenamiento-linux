@@ -14,7 +14,7 @@ Pensado para Arch/CachyOS con systemd, pero las ideas aplican a cualquier distri
 | Un backup en el mismo disco no sirve si el disco muere | Tres capas: snapper (mismo disco), btrbk (otro disco), restic (otro lugar) |
 | No sé si mis discos están sanos | `discos`: salud SMART y espacio en español, con veredicto Bien / Atención / Crítico |
 | Me entero tarde de que un disco se llenó o falla | `disk-alert` y `smartd` mandan notificaciones de escritorio |
-| Respaldar el teléfono en Linux | `movil`: backup por USB de iPhone y Android, automático al conectar |
+| Respaldar el teléfono en Linux | `movil`: backup por USB de iPhone y Android; al conectar pregunta si respaldar |
 | Llevar archivos a un servidor propio | `nube-sync` (Nextcloud) y `restic-nube` (backup cifrado y comprimido) |
 
 ## Arquitectura
@@ -42,7 +42,7 @@ El porqué de cada decisión está en [docs/decisiones.md](docs/decisiones.md).
 |---|---|---|
 | `discos` | usuario | Salud y espacio de todos los discos. `discos plain` para lector de pantalla |
 | `disk-alert` | usuario (timer) | Notifica si un disco pasa el umbral de uso |
-| `movil` | usuario | Backup de iPhone/Android por USB; automático vía udev |
+| `movil` | usuario | Backup de iPhone/Android por USB; al conectar pregunta (aviso con botones) |
 | `iphone-vm` | usuario | Pasa el iPhone a una VM QEMU (macOS) y de vuelta |
 | `nube-sync` | usuario (timer) | `docs`: sincroniza una carpeta con Nextcloud; `datos`: solo sube |
 | `restic-nube` | root (timer) | Backup cifrado del sistema y teléfonos a un servidor por SFTP |

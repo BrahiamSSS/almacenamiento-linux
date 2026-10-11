@@ -66,3 +66,18 @@ Formato: contexto → decisión → alternativas descartadas → cuándo revisar
   archivos 600 aparte.
 - **Por qué**: repo público y reutilizable; el mismo código sirve en otra máquina cambiando
   solo un archivo.
+
+## 11. Preguntar antes de respaldar un teléfono, con un aviso con botones
+- **Contexto**: respaldar solo al conectar copiaba también teléfonos ajenos (uno prestado,
+  uno que solo se enchufa a cargar).
+- **Decisión**: `movil auto` pregunta con una notificación con acciones (Respaldar / Siempre /
+  Ahora no / Nunca) y recuerda «Siempre» y «Nunca» por dispositivo. Valor por defecto y ante
+  cualquier fallo: preguntar; sin respuesta no se respalda.
+- **Por qué un aviso y no un menú central**: no roba el teclado (el aviso puede salir hasta
+  30 s después de conectar, cuando ya estás escribiendo otra cosa), es el patrón habitual de
+  "dispositivo conectado" y funciona en cualquier escritorio con el estándar de
+  notificaciones, sin depender de un lanzador concreto.
+- **Descartado**: menú tipo dmenu del shell (toma el foco; ata la herramienta a un escritorio);
+  diálogos zenity/kdialog (dependencia nueva).
+- **Simplificación**: tras «Ahora no» no se insiste durante 10 min, por tiempo. Revisar si
+  molesta: la alternativa es rastrear la desconexión real con udev.

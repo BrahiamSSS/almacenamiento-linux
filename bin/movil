@@ -2,11 +2,15 @@
 """movil: backup por USB de iPhone/iPad y Android a $MOVIL_DIR (por defecto /mnt/datos/dispositivos).
 
 Uso: movil [comando] [--plain]
-  (sin comando)                   respalda todo lo conectado
+  (sin comando)                   respalda todo lo conectado (menos lo excluido)
   lista (list, estado)            dispositivos, último backup y snapshots
+  politica                        qué pasa al conectar cada dispositivo
+  politica <disp> preguntar|siempre|nunca
+                                  cambia esa decisión (<disp>: parte del nombre o del id)
   restaurar <disp> [snap|ultimo]  devuelve un backup al teléfono conectado
-  configurar                      prepara el backup automático y dice qué falta
-  auto                            lo que corre solo al conectar (máx. 1 vez/24 h)
+  configurar                      prepara el backup al conectar y dice qué falta
+  auto                            lo que corre solo al conectar: pregunta con un aviso
+                                  (Respaldar / Siempre / Ahora no / Nunca), máx. 1 vez/24 h
   ayuda | --selftest
   --plain    sin colores ni símbolos (lectores de pantalla, logs).
              También con NO_COLOR, TERM=dumb o salida redirigida.
@@ -16,9 +20,14 @@ Cada dispositivo es un subvolumen btrfs con:
   archivos/           vista legible: iOS por dominio (reflinks, 0 bytes extra,
                       Fotos -> carrete), Android = copia de /sdcard
 Tras cada backup: snapshot read-only en .snapshots/<dispositivo>/; se guardan
-7 diarios + 4 semanales. Variable MOVIL_DIR cambia la carpeta raíz.
+7 diarios + 4 semanales. Variables (entorno o /etc/almacenamiento.env):
+MOVIL_DIR cambia la carpeta raíz; MOVIL_AUTO_HORAS, las 24 h entre backups al conectar.
+Lo que respondes en el aviso se guarda en ~/.config/movil/dispositivos.json.
 """
+import contextlib
 import fcntl
+import io
+import json
 import os
 import plistlib
 import re
@@ -46,7 +55,18 @@ ROOT = Path(_conf("MOVIL_DIR", "/mnt/datos/dispositivos"))
 TS = "%Y%m%dT%H%M%S"
 FICLONE = 0x40049409
 SKIP_ANDROID = ("Android/data/", "Android/obb/")  # inaccesibles sin root desde Android 11
-AUTO_EVERY = 24 * 3600
+try:
+    AUTO_EVERY = float(_conf("MOVIL_AUTO_HORAS", "24")) * 3600
+except ValueError:
+    AUTO_EVERY = 24 * 3600
+ASK_WAIT = 120   # s que el aviso espera respuesta; sin respuesta = «Ahora no»
+# ponytail: pausa por tiempo tras «Ahora no» (el USB a veces se reconecta solo);
+# si molesta, rastrear la desconexión real con una regla udev ACTION=="remove".
+ASK_PAUSE = 600
+POLICY = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config", "movil", "dispositivos.json")
+POLITICAS = {"preguntar": "pregunta antes de respaldar",
+             "siempre": "respalda sin preguntar",
+             "nunca": "excluido: ni respalda ni pregunta"}
 KEEP_DAYS, KEEP_WEEKS = 7, 4
 UNIT = Path.home() / ".config/systemd/user/movil-auto.service"
 RULE_SRC = Path.home() / ".local/share/movil/90-movil.rules"
@@ -67,6 +87,7 @@ ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTER
 """
 
 ALIAS = {"list": "lista", "ls": "lista", "status": "lista", "estado": "lista",
+         "política": "politica", "policy": "politica",
          "backup": "respaldar", "restore": "restaurar", "setup": "configurar",
          "help": "ayuda", "-h": "ayuda", "--help": "ayuda"}
 
@@ -189,6 +210,71 @@ def snapshot(dev):
 def subvolume(path):
     if not path.exists():
         subprocess.run(["btrfs", "-q", "subvolume", "create", str(path)], check=True)
+
+
+# ---------- qué hacer al conectar ----------
+
+def corto(label):
+    """«Pixel 8 (Android 15)» -> «Pixel 8»."""
+    return label.split(" (")[0]
+
+
+def politicas():
+    """{id: {nombre, politica, pospuesto}}. Si falta o está dañado, vacío: todo vuelve a «preguntar»."""
+    try:
+        regs = json.loads(POLICY.read_text())
+    except (OSError, ValueError):
+        return {}
+    return regs if isinstance(regs, dict) else {}
+
+
+def guardar_politicas(regs):
+    try:
+        POLICY.parent.mkdir(parents=True, exist_ok=True)
+        tmp = POLICY.with_suffix(".tmp")
+        tmp.write_text(json.dumps(regs, indent=2, ensure_ascii=False) + "\n")
+        tmp.replace(POLICY)
+    except OSError as e:
+        UI.say(WARN, f"No pude guardar {POLICY}: {e}")
+
+
+def preguntar(label, last):
+    """Aviso con botones. Devuelve ahora, siempre, luego o nunca; "" si nadie respondió."""
+    estado = f"Último backup: {ago(time.time() - last)}." if last else "Aún no tiene backup en este equipo."
+    cmd = ["notify-send", "-a", "movil", "-i", "phone", "-t", str(ASK_WAIT * 1000),
+           "-A", "ahora=Respaldar", "-A", "siempre=Siempre", "-A", "luego=Ahora no", "-A", "nunca=Nunca",
+           f"¿Respaldar «{corto(label)}»?",
+           f"{estado}\nSiempre: sin volver a preguntar. Nunca: excluirlo."]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=ASK_WAIT + 15).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r if r in ("ahora", "siempre", "luego", "nunca") else ""
+
+
+def decidir(reg, last, ask, now=None):
+    """¿Respaldar al conectar? -> (sí/no, motivo). Guarda en `reg` lo que se responda."""
+    now = now or time.time()
+    pol = reg.get("politica", "preguntar")
+    if pol == "nunca":
+        return False, "excluido (para incluirlo: movil politica)"
+    if last and now - last < AUTO_EVERY:
+        return False, f"último backup {ago(now - last)}, se omite"
+    if pol == "siempre":
+        return True, "siempre"
+    if now - reg.get("pospuesto", 0) < ASK_PAUSE:
+        return False, f"ya se preguntó {ago(now - reg['pospuesto'])}, todavía no se insiste"
+    r = ask()
+    if r in ("ahora", "siempre"):
+        reg.pop("pospuesto", None)
+        if r == "siempre":
+            reg["politica"] = r
+        return True, r
+    if r == "nunca":
+        reg["politica"] = r
+        return False, "excluido desde ahora (para incluirlo: movil politica)"
+    reg["pospuesto"] = now
+    return False, "ahora no" if r else "nadie respondió al aviso"
 
 
 # ---------- iOS ----------
@@ -366,18 +452,33 @@ def run_one(kind, ident, label, dev):
 def respaldar(auto=False):
     held = lock()
     if not held:
-        UI.say(WARN, "Ya hay un backup en curso")
+        UI.say(WARN, "Ya hay un backup en curso, o un aviso esperando tu respuesta")
         return 1
     devs = connected(wait=30 if auto else 0)
     if not devs:
         UI.say(WARN, "No hay teléfonos conectados")
         UI.dim("¿iPhone pasado a la VM? → iphone-vm off · ¿Android sin depuración USB?")
         return 1
+    regs = politicas()
+    saved = json.dumps(regs, sort_keys=True)
     results = []
     for kind, ident, label, dev in devs:
-        last = last_backup(dev)
-        if auto and last and time.time() - last < AUTO_EVERY:
-            UI.say(INFO, f"{label}: último backup {ago(time.time() - last)}, se omite")
+        reg = regs.setdefault(ident, {})
+        reg["nombre"] = label
+        before = reg.get("politica", "preguntar")
+        if auto:
+            last = last_backup(dev)
+            go, why = decidir(reg, last, lambda: preguntar(label, last))
+        else:  # a mano se respalda sin preguntar, salvo lo excluido
+            go, why = before != "nunca", "excluido (para incluirlo: movil politica)"
+        if json.dumps(regs, sort_keys=True) != saved:  # antes del backup, que puede tardar
+            guardar_politicas(regs)
+            saved = json.dumps(regs, sort_keys=True)
+        after = reg.get("politica", "preguntar")
+        if after != before:
+            UI.notify(INFO, f"«{corto(label)}»: {POLITICAS[after]}", "Para cambiarlo: movil politica")
+        if not go:
+            UI.say(INFO, f"{label}: {why}")
             continue
         results.append(run_one(kind, ident, label, dev))
     return 0 if all(results) else 1
@@ -399,6 +500,37 @@ def lista():
             UI.say(OK if age < 7 * 86400 else WARN if age < 30 * 86400 else ERR, f"Último backup {ago(age)}")
             UI.dim(f"{len(snaps)} snapshots: {snaps[0]} … {snaps[-1]}" if len(snaps) > 1 else f"snapshot {snaps[0]}")
         UI.dim(str(dev / "archivos"))
+    return 0
+
+
+def politica(name=None, valor=None):
+    regs = politicas()
+    if name is None:
+        if not regs:
+            UI.say(INFO, "Aún no hay dispositivos registrados: aparecen aquí al conectarlos")
+            return 0
+        UI.title("Al conectar cada dispositivo")
+        for ident, reg in sorted(regs.items(), key=lambda kv: kv[1].get("nombre", "")):
+            pol = reg.get("politica", "preguntar")
+            UI.say(INFO, f"{reg.get('nombre', ident)}: {POLITICAS.get(pol, pol)}")
+            UI.dim(f"id …{ident[-8:]}")
+        UI.dim("Cambiar: movil politica <parte del nombre o id> preguntar|siempre|nunca")
+        return 0
+    if valor not in POLITICAS:
+        UI.say(ERR, "Uso: movil politica [<dispositivo> preguntar|siempre|nunca]")
+        return 2
+    n = name.lower()
+    hits = [i for i, r in regs.items()
+            if n in f"{r.get('nombre', '')} {i}".lower() or n.endswith(i[-8:].lower())]
+    if len(hits) != 1:
+        UI.say(ERR, f"«{name}» coincide con {len(hits)} dispositivos; debe ser exactamente uno")
+        UI.dim("Registrados: " + (", ".join(f"{r.get('nombre', i)} (…{i[-8:]})" for i, r in regs.items()) or "ninguno"))
+        return 1
+    reg = regs[hits[0]]
+    reg["politica"] = valor
+    reg.pop("pospuesto", None)
+    guardar_politicas(regs)
+    UI.say(OK, f"{reg.get('nombre', hits[0])}: {POLITICAS[valor]}")
     return 0
 
 
@@ -466,7 +598,8 @@ def configurar():
         for fix in pending:
             print(f"  {fix}")
         return 1
-    UI.say(OK, "Todo listo: al conectar un teléfono se respalda solo (máx. 1 vez cada 24 h)")
+    UI.say(OK, "Todo listo: al conectar un teléfono, un aviso pregunta si respaldarlo (máx. 1 vez cada 24 h)")
+    UI.dim("Lo decidido por dispositivo: movil politica")
     UI.dim("Android: solo si la depuración USB queda activa en el teléfono")
     return 0
 
@@ -513,6 +646,35 @@ def selftest():
     assert 7 <= len(kept) <= 7 + KEEP_WEEKS
     assert min(kept) >= time.strftime(TS, time.localtime(t0 - 35 * 86400))
     assert ago(90) == "hace 1 min" and dur(75) == "1 min 15 s"
+
+    # al conectar: pregunta por defecto, recuerda «siempre»/«nunca», no insiste tras «ahora no»
+    global AUTO_EVERY, POLICY
+    AUTO_EVERY, now = 24 * 3600, 2_000_000_000.0
+
+    def nadie():
+        raise AssertionError("no debía preguntar")
+    reg = {}
+    assert not decidir(reg, None, lambda: "luego", now)[0] and reg == {"pospuesto": now}
+    assert not decidir(reg, None, nadie, now + ASK_PAUSE - 1)[0]                 # en pausa
+    assert decidir(reg, None, lambda: "ahora", now + ASK_PAUSE)[0] and reg == {}  # una vez, sin recordar
+    assert not decidir(reg, now, nadie, now + 3600)[0]                            # backup reciente
+    assert not decidir({}, None, lambda: "", now)[0]                              # sin respuesta = no
+    assert decidir(reg, None, lambda: "siempre", now)[0] and reg == {"politica": "siempre"}
+    assert decidir(reg, now - AUTO_EVERY, nadie, now)[0]                          # ya no pregunta
+    assert not decidir(reg, now - 60, nadie, now)[0]                              # …pero máx. 1 vez/24 h
+    reg = {}
+    assert not decidir(reg, None, lambda: "nunca", now)[0] and reg == {"politica": "nunca"}
+    assert not decidir(reg, None, nadie, now + 10 * AUTO_EVERY)[0]
+    assert corto("Pixel 8 (Android 15)") == "Pixel 8"
+    with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
+        POLICY = Path(tmp, "movil", "dispositivos.json")
+        assert politicas() == {}
+        guardar_politicas({"SERIE-0001ABCD": {"nombre": "Pixel 8 (Android 15)"}})
+        assert politica("abcd", "nunca") == 0 and politica("Pixel", "siempre") == 0   # por id o por nombre
+        assert politicas()["SERIE-0001ABCD"]["politica"] == "siempre"
+        assert politica("nadie", "nunca") == 1 and politica("pixel", "quizás") == 2
+        POLICY.write_text("{dañado")
+        assert politicas() == {}
     print("selftest ok")
     return 0
 
@@ -531,6 +693,11 @@ def main(argv):
         return 0
     if cmd == "configurar":
         return configurar()
+    if cmd == "politica" and len(args) in (1, 3):
+        return politica(*args[1:])
+    if cmd == "politica":
+        UI.say(ERR, "Uso: movil politica [<dispositivo> preguntar|siempre|nunca]")
+        return 2
     if not ROOT.is_dir():
         UI.say(ERR, f"Falta {ROOT}. Corre «movil configurar»")
         return 1
@@ -544,7 +711,7 @@ def main(argv):
         UI.say(ERR, "Uso: movil restaurar <dispositivo> [snapshot|ultimo]  (nombres en «movil lista»)")
     else:
         UI.say(ERR, f"Comando desconocido: «{args[0]}»")
-        UI.dim("Comandos: lista, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
+        UI.dim("Comandos: lista, politica, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
     return 2
 
 

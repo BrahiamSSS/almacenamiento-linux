@@ -27,18 +27,54 @@ Retención: 7 diarios + 4 semanales, gestionada por el propio `movil`.
 - Android: `android-tools` (adb) con la **depuración USB** activada.
 - `$MOVIL_DIR` en btrfs, montado con `user_subvol_rm_allowed` para que `movil` pueda
   borrar sus snapshots viejos sin root.
+- `notify-send` (libnotify 0.7.10 o superior) para el aviso con botones.
 
 `movil configurar` revisa todo esto y dice qué falta.
 
-## Automático al conectar
+## Al conectar: pregunta antes de respaldar
 
 [`etc/udev/90-movil.rules`](../etc/udev/90-movil.rules) detecta iPhones/iPads (vendor
 Apple 05ac) y Android con adb, y arranca el servicio de usuario `movil-auto.service`,
-que corre `movil auto`:
+que corre `movil auto`. Por cada teléfono muestra un aviso de escritorio con cuatro botones:
 
-- como máximo un backup cada 24 h por dispositivo;
-- con prioridad baja de CPU y disco;
-- con notificación de escritorio al terminar o fallar.
+| Botón | Ahora | La próxima vez que lo conectes |
+|---|---|---|
+| **Respaldar** | hace el backup | vuelve a preguntar |
+| **Siempre** | hace el backup | respalda sin preguntar |
+| **Ahora no** (o no responder en 2 min) | nada | vuelve a preguntar, pero no antes de 10 min |
+| **Nunca** | excluye el dispositivo | ni pregunta ni respalda; `movil` a mano también lo salta |
+
+- Solo pregunta (o respalda) si el último backup tiene **más de 24 h** (`MOVIL_AUTO_HORAS`):
+  así no molesta cada vez que enchufas el teléfono a cargar.
+- Un teléfono que nunca se había conectado también pregunta: nada se respalda sin tu permiso.
+- Tras «Siempre» o «Nunca» llega un aviso que confirma lo guardado y cómo cambiarlo.
+- El backup corre con prioridad baja de CPU y disco, y avisa al terminar o fallar.
+
+### Ver y cambiar lo decidido
+
+```bash
+movil politica                        # qué hace cada dispositivo al conectarse
+movil politica pixel siempre          # por parte del nombre…
+movil politica 1a2b3c4d preguntar     # …o por el final del id que muestra la lista
+```
+
+Valores: `preguntar` (por defecto), `siempre`, `nunca`. Se guardan en
+`~/.config/movil/dispositivos.json`; si ese archivo se borra o se daña, todo vuelve a
+`preguntar`, que es el valor seguro.
+
+### Requisito: avisos con botones
+
+El servidor de notificaciones debe admitir acciones (casi todos: GNOME, KDE, mako, dunst,
+swaync, Noctalia…). Compruébalo; debe aparecer `actions`:
+
+```bash
+gdbus call --session --dest org.freedesktop.Notifications \
+  --object-path /org/freedesktop/Notifications \
+  --method org.freedesktop.Notifications.GetCapabilities
+```
+
+Si el tuyo no las admite, el aviso no tendrá botones y nada se respaldará solo: fija la
+decisión a mano con `movil politica <disp> siempre`.
 
 ## Restaurar
 
