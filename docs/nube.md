@@ -57,7 +57,7 @@ cuesta varias consultas a la base de datos de Nextcloud.
 | Tandas espaciadas | `nube-datos.timer` | arranque + 30 min, luego cada 2 h ± 10 min (sirve en un portátil apagado de noche) |
 | `datos` despacio | `nube-sync` | 1 subida y 2 comparaciones a la vez, `NUBE_TPS=4` peticiones/s |
 | Más lento de día | `nube-sync` | `NUBE_BWLIMIT="08:00,1M 22:00,off"` (formato de horario de rclone) |
-| Sin reintentos en bloque | `nube-sync` | rclone `--retries 1`, nextcloudcmd `--max-sync-retries 1`: lo que falle se reintenta en la próxima corrida, no repite todo |
+| Sin reintentos en bloque | `nube-sync` | rclone `--retries 1 --low-level-retries 2`, nextcloudcmd `--max-sync-retries 1`: lo que falle se reintenta en la próxima corrida, no repite todo. Sin `--low-level-retries`, rclone repite 10 veces cada archivo que el servidor rechaza con un 500 |
 | Nunca dos a la vez | `nube-sync` | `docs` y `datos` comparten un candado; el segundo espera |
 | restic sin reescribir cada noche | `restic-nube` | `forget` diario; `prune --max-unused 10%` solo los domingos |
 

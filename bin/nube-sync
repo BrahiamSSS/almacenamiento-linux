@@ -70,7 +70,7 @@ for o in "${origenes[@]}"; do
     resto=$(( fin - $(date +%s) ))
     [ "$resto" -gt 0 ] || { echo "Tanda cumplida: lo que falta sube en la próxima"; break; }
     rclone copy "${o%%|*}" "$NUBE_REMOTO:${o#*|}" \
-        --transfers 1 --checkers 2 --tpslimit "${NUBE_TPS:-4}" --retries 1 \
+        --transfers 1 --checkers 2 --tpslimit "${NUBE_TPS:-4}" --retries 1 --low-level-retries 2 \
         --bwlimit "${NUBE_BWLIMIT:-08:00,1M 22:00,off}" \
         --max-duration "${resto}s" --cutoff-mode soft \
         --log-level NOTICE --stats 10m --stats-one-line
