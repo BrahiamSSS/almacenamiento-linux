@@ -78,6 +78,13 @@ instala `install.sh`. Lo propio de tu máquina va en `~/.config/nube/exclude-loc
 (no está en el repo): una ruta por línea, relativa a la carpeta sincronizada, por ejemplo
 `Trabajo/MiProyecto`. Evita nombres sueltos si se repiten en otras carpetas.
 
+- **Sin `/` al inicio.** `/Trabajo/MiProyecto` no excluye nada.
+- `nube-sync` junta las dos listas en un archivo temporal llamado **`sync-exclude.lst`**, y el
+  nombre importa. `nextcloudcmd --exclude` ancla las rutas a la carpeta donde está el archivo
+  de exclusión, salvo que se llame así: entonces las ancla a la carpeta sincronizada. Con
+  cualquier otro nombre no aplica **ninguna** exclusión, ni las genéricas.
+  Comprobado con `nextcloudcmd` 34.
+
 ### Quitar algo del servidor sin borrarlo en tu PC
 
 `docs` es bidireccional: si borras en el servidor una carpeta que se sigue sincronizando,
@@ -86,7 +93,10 @@ instala `install.sh`. Lo propio de tu máquina va en `~/.config/nube/exclude-loc
 1. Detén la sincronización: `systemctl --user stop nube-docs.timer`.
 2. Agrega la ruta a `exclude-local.lst`.
 3. Comprueba en una carpeta de prueba que la exclusión funciona y que borrar en el servidor
-   una carpeta excluida no toca la local.
+   una carpeta excluida no toca la local. **No te saltes este paso**: con una exclusión que
+   no aplica, el borrado del servidor se propaga a tu PC sin aviso.
+   Prueba: sincroniza una carpeta de prueba entera, agrega la exclusión, sincroniza,
+   bórrala en el servidor, sincroniza otra vez y mira si sigue en tu PC.
 4. Bórrala en el servidor, de a una carpeta si son muchas: `rclone purge nube:Documentos/<ruta>`.
    Queda en la papelera de Nextcloud unos 30 días.
 5. Corre `nube-sync docs` y comprueba que la copia local sigue igual. Reactiva el timer.
@@ -150,6 +160,7 @@ ilegibles.
 | Síntoma | Causa | Solución |
 |---|---|---|
 | Subidas lentísimas con miles de archivos pequeños | Cada archivo son varias consultas a la base de datos; servidor con HDD o compartido | Ver [Cuidar el servidor](#cuidar-el-servidor); excluir repos y carpetas que cambian sin parar |
+| `nextcloudcmd --exclude` no excluye nada | El archivo no se llama `sync-exclude.lst`, o la ruta empieza con `/` | Ver [Excluir carpetas solo en esta máquina](#excluir-carpetas-solo-en-esta-máquina) |
 | `502 Bad Gateway` | Nextcloud detenido o saturado detrás del proxy | Comprobar el contenedor; las tandas siguientes reintentan solas |
 | El diario solo guarda las últimas horas | Un proceso muy verboso llena el límite del diario | `--silent` / nivel `NOTICE` (ya incluido); ver `journalctl --disk-usage` |
 | `Class "WoltLab\WebpExif\ChunkType" not found` (500) al subir `.webp` | Instalación del servidor incompleta tras una actualización | `occ maintenance:repair`; si no, actualizar el contenedor |

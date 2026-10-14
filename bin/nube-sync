@@ -38,8 +38,12 @@ termina() {  # termina CÓDIGO MOTIVO
 }
 
 if [ "$MODO" = docs ]; then
-    exc=$(mktemp)
-    trap 'rm -f "$exc"' EXIT
+    # nextcloudcmd ancla las rutas al directorio del archivo de exclusión, salvo que se
+    # llame sync-exclude.lst: entonces las ancla a la carpeta sincronizada. Con otro nombre
+    # no aplica ninguna exclusión, ni siquiera las genéricas.
+    excdir=$(mktemp -d)
+    trap 'rm -rf "$excdir"' EXIT
+    exc=$excdir/sync-exclude.lst
     cat "$HOME/.config/nube/exclude.lst" "$HOME/.config/nube/exclude-local.lst" > "$exc" 2>/dev/null
     rclone mkdir "$NUBE_REMOTO:$NUBE_DOCS_REMOTO" || termina 1 "no se pudo conectar con el servidor"
     # Una petición a la vez, velocidad limitada y sin reintentar toda la sincronización:
