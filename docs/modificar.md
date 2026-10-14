@@ -12,7 +12,10 @@ y el repo no se desincronizan. Lo específico de la máquina va en `/etc/almacen
 | Cambiar los umbrales de salud de `discos` | `bin/discos` | Funciones `level_life`, `level_space`, `level_temp`; ajusta también `selftest()` y corre `discos --selftest` |
 | Subir otra carpeta a la nube (solo subida) | `/etc/almacenamiento.env` | Agrega `"ruta:Destino"` a `NUBE_SUBIR` (rutas sin espacios) |
 | Sincronizar otra carpeta en ambos sentidos | `systemd/user/` | Copia `nube-docs.*` con otro nombre y otra variable; o usa el cliente gráfico |
-| Excluir más carpetas de la sincronización | `config/nube-exclude.lst` | Una entrada por línea; comodines permitidos |
+| Excluir más carpetas de la sincronización (para todos) | `config/nube-exclude.lst` | Una entrada por línea; comodines permitidos |
+| Excluir carpetas solo en esta máquina | `~/.config/nube/exclude-local.lst` | Ruta relativa a la carpeta sincronizada; ver [nube.md](nube.md#excluir-carpetas-solo-en-esta-máquina) |
+| Quitar algo del servidor sin borrarlo en tu PC | — | Sigue el orden de [nube.md](nube.md#quitar-algo-del-servidor-sin-borrarlo-en-tu-pc) |
+| Subir más rápido o más despacio | `/etc/almacenamiento.env` | `NUBE_TANDA_MIN`, `NUBE_TPS`, `NUBE_BWLIMIT`, `NUBE_UPLIMIT_KB` |
 | Excluir más rutas del backup restic | `etc/restic-exclude` | Rutas bajo `/run/restic-src/{root,home}` |
 | Cambiar la retención de restic | `/etc/almacenamiento.env` | `RESTIC_RETENCION="--keep-daily 14 --keep-monthly 12"` |
 | Cambiar la retención de btrbk | `/etc/btrbk/btrbk.conf` | `target_preserve` |
@@ -20,6 +23,7 @@ y el repo no se desincronizan. Lo específico de la máquina va en `/etc/almacen
 | Cambiar de servidor | `/etc/almacenamiento.env` | `SERVIDOR_SSH`, `RESTIC_RUTA`, `NUBE_URL`; `sudo restic-nube init` en el nuevo; nuevo remoto rclone y `.netrc` |
 | Respaldar otro teléfono | — | Conéctalo: `movil` lo detecta, pregunta y crea su subvolumen |
 | Que un teléfono se respalde sin preguntar, o excluirlo | — | `movil politica <disp> siempre` / `nunca` (`preguntar` lo deshace) |
+| Que conectar teléfonos no haga nada por un tiempo | — | `movil pausar`; para volver, `movil reanudar` |
 | Cambiar las 24 h entre backups al conectar | `/etc/almacenamiento.env` | `MOVIL_AUTO_HORAS=12` |
 | Cambiar cuánto espera el aviso o la pausa tras «Ahora no» | `bin/movil` | Constantes `ASK_WAIT` (120 s) y `ASK_PAUSE` (600 s) |
 | Cambiar la carpeta de los teléfonos | `/etc/almacenamiento.env` | `MOVIL_DIR`; mueve los subvolúmenes existentes con `btrfs subvolume snapshot` + borrar |

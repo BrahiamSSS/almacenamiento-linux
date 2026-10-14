@@ -1,37 +1,81 @@
 #!/bin/bash
-# Sincroniza con Nextcloud. Configuración: /etc/almacenamiento.env
-#   nube-sync docs    $NUBE_DOCS_LOCAL <-> $NUBE_DOCS_REMOTO  (bidireccional, nextcloudcmd)
+# Sincroniza con Nextcloud sin saturar el servidor. Configuración: /etc/almacenamiento.env
+#   nube-sync docs    $NUBE_DOCS_LOCAL <-> $NUBE_DOCS_REMOTO  (bidireccional, nextcloudcmd, despacio)
 #   nube-sync datos   $NUBE_SUBIR y vistas archivos/ de teléfonos  (solo subida, rclone copy: nunca borra)
+#                     en tandas de $NUBE_TANDA_MIN minutos; la siguiente sigue donde quedó.
+# docs y datos nunca corren a la vez. Avisa al 2.º fallo seguido del mismo modo (y cada 12).
+# Exclusiones: ~/.config/nube/exclude.lst (genéricas) + ~/.config/nube/exclude-local.lst (de esta máquina).
 set -uo pipefail
 CONF=/etc/almacenamiento.env
 [ -r "$CONF" ] || { echo "Falta $CONF (ver config.env.example)" >&2; exit 2; }
 . "$CONF"
+MODO=${1:-}
+case $MODO in
+    docs|datos) ;;
+    *) echo "Uso: nube-sync docs|datos" >&2; exit 2 ;;
+esac
 
-fail() {
-    notify-send -u critical -i network-error "Nube: falló '$1'" "Revisa: journalctl --user -u nube-$1"
+# Un turno a la vez: si el otro modo está corriendo, espera a que termine.
+exec 9>"${XDG_RUNTIME_DIR:-/tmp}/nube-sync.lock"
+flock 9
+
+ESTADO=${XDG_STATE_HOME:-$HOME/.local/state}/nube
+mkdir -p "$ESTADO"
+
+termina() {  # termina CÓDIGO MOTIVO
+    if [ "$1" -eq 0 ]; then
+        rm -f "$ESTADO/fallos-$MODO"
+        exit 0
+    fi
+    local n=$(( $(cat "$ESTADO/fallos-$MODO" 2>/dev/null || echo 0) + 1 ))
+    echo "$n" > "$ESTADO/fallos-$MODO"
+    echo "Falló ($n seguidas): $2" >&2
+    if [ "$n" -eq 2 ] || [ $(( n % 12 )) -eq 0 ]; then
+        notify-send -u critical -i network-error "Nube: «$MODO» falló $n veces seguidas" \
+            "$2. Revisa: journalctl --user -u nube-$MODO"
+    fi
     exit 1
 }
 
-case ${1:-} in
-    docs)
-        rclone mkdir "$NUBE_REMOTO:$NUBE_DOCS_REMOTO" || fail docs
-        nextcloudcmd -n --non-interactive --exclude "$HOME/.config/nube/exclude.lst" \
-            --path "$NUBE_DOCS_REMOTO" "$NUBE_DOCS_LOCAL" "$NUBE_URL" || fail docs
-        ;;
-    datos)
-        for par in $NUBE_SUBIR; do
-            rclone copy "${par%%:*}" "$NUBE_REMOTO:${par#*:}" --transfers 4 --stats-one-line -v || fail datos
-        done
-        if [ -n "${NUBE_CELULARES:-}" ]; then
-            for d in "$MOVIL_DIR"/*/; do
-                [ -d "$d/archivos" ] || continue
-                rclone copy "$d/archivos" "$NUBE_REMOTO:$NUBE_CELULARES/$(basename "$d")" \
-                    --transfers 4 --stats-one-line -v || fail datos
-            done
-        fi
-        ;;
-    *)
-        echo "Uso: nube-sync docs|datos" >&2
-        exit 2
-        ;;
-esac
+if [ "$MODO" = docs ]; then
+    exc=$(mktemp)
+    trap 'rm -f "$exc"' EXIT
+    cat "$HOME/.config/nube/exclude.lst" "$HOME/.config/nube/exclude-local.lst" > "$exc" 2>/dev/null
+    rclone mkdir "$NUBE_REMOTO:$NUBE_DOCS_REMOTO" || termina 1 "no se pudo conectar con el servidor"
+    # Una petición a la vez, velocidad limitada y sin reintentar toda la sincronización:
+    # lo que falle se reintenta en la próxima corrida.
+    OWNCLOUD_MAX_PARALLEL=1 nextcloudcmd -n --non-interactive --silent --max-sync-retries 1 \
+        --uplimit "${NUBE_UPLIMIT_KB:-2048}" --exclude "$exc" \
+        --path "$NUBE_DOCS_REMOTO" "$NUBE_DOCS_LOCAL" "$NUBE_URL"
+    termina $? "nextcloudcmd terminó con error"
+fi
+
+# datos: un plazo común para toda la tanda, repartido entre los orígenes en orden.
+fin=$(( $(date +%s) + ${NUBE_TANDA_MIN:-30} * 60 ))
+origenes=()
+for par in $NUBE_SUBIR; do
+    origenes+=("${par%%:*}|${par#*:}")
+done
+if [ -n "${NUBE_CELULARES:-}" ]; then
+    for d in "$MOVIL_DIR"/*/; do
+        [ -d "$d/archivos" ] && origenes+=("${d}archivos|$NUBE_CELULARES/$(basename "$d")")
+    done
+fi
+error=0
+for o in "${origenes[@]}"; do
+    resto=$(( fin - $(date +%s) ))
+    [ "$resto" -gt 0 ] || { echo "Tanda cumplida: lo que falta sube en la próxima"; break; }
+    rclone copy "${o%%|*}" "$NUBE_REMOTO:${o#*|}" \
+        --transfers 1 --checkers 2 --tpslimit "${NUBE_TPS:-4}" --retries 1 \
+        --bwlimit "${NUBE_BWLIMIT:-08:00,1M 22:00,off}" \
+        --max-duration "${resto}s" --cutoff-mode soft \
+        --log-level NOTICE --stats 10m --stats-one-line
+    rc=$?
+    case $rc in
+        0) ;;
+        10) echo "Tanda cumplida: lo que falta sube en la próxima"; break ;;  # --max-duration alcanzado
+        *) error=$rc; echo "Error $rc subiendo a ${o#*|}" >&2 ;;
+    esac
+done
+[ "$error" -eq 0 ] || termina 1 "rclone terminó con error $error"
+termina 0

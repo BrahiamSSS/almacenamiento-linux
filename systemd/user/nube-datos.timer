@@ -1,9 +1,10 @@
 [Unit]
-Description=Nextcloud: subir Datos y Celulares cada día
+Description=Nextcloud: subir Datos y Celulares en tandas cada 2 horas
 
 [Timer]
-OnCalendar=*-*-* 02:00
-Persistent=true
+OnBootSec=30min
+OnUnitActiveSec=2h
+RandomizedDelaySec=10min
 
 [Install]
 WantedBy=timers.target

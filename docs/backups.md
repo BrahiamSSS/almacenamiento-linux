@@ -74,5 +74,7 @@ Las rutas dentro del backup empiezan por `/run/restic-src/root` (sistema) y
 
 ### Verificación
 
-Los domingos `restic-nube` revisa al azar el 5 % de los datos (`check --read-data-subset 5%`).
+Los domingos `restic-nube` libera espacio (`prune --max-unused 10%`, solo si más del 10 %
+del repositorio es basura) y revisa al azar el 5 % de los datos (`check --read-data-subset 5%`).
+El resto de los días solo marca los snapshots que sobran (`forget`), que es barato para el servidor.
 Prueba una restauración real de vez en cuando: un backup que nunca se probó no es un backup.

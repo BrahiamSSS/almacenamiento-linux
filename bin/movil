@@ -7,6 +7,8 @@ Uso: movil [comando] [--plain]
   politica                        qué pasa al conectar cada dispositivo
   politica <disp> preguntar|siempre|nunca
                                   cambia esa decisión (<disp>: parte del nombre o del id)
+  pausar | reanudar               apaga o enciende lo que pasa al conectar, para todos los
+                                  teléfonos (a mano, «movil» sigue respaldando)
   restaurar <disp> [snap|ultimo]  devuelve un backup al teléfono conectado
   configurar                      prepara el backup al conectar y dice qué falta
   auto                            lo que corre solo al conectar: pregunta con un aviso
@@ -22,7 +24,8 @@ Cada dispositivo es un subvolumen btrfs con:
 Tras cada backup: snapshot read-only en .snapshots/<dispositivo>/; se guardan
 7 diarios + 4 semanales. Variables (entorno o /etc/almacenamiento.env):
 MOVIL_DIR cambia la carpeta raíz; MOVIL_AUTO_HORAS, las 24 h entre backups al conectar.
-Lo que respondes en el aviso se guarda en ~/.config/movil/dispositivos.json.
+Lo que respondes en el aviso se guarda en ~/.config/movil/dispositivos.json;
+la pausa es el archivo ~/.config/movil/pausa.
 """
 import contextlib
 import fcntl
@@ -64,6 +67,7 @@ ASK_WAIT = 120   # s que el aviso espera respuesta; sin respuesta = «Ahora no»
 # si molesta, rastrear la desconexión real con una regla udev ACTION=="remove".
 ASK_PAUSE = 600
 POLICY = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config", "movil", "dispositivos.json")
+PAUSA = POLICY.with_name("pausa")   # si existe, «auto» no hace nada: interruptor general
 POLITICAS = {"preguntar": "pregunta antes de respaldar",
              "siempre": "respalda sin preguntar",
              "nunca": "excluido: ni respalda ni pregunta"}
@@ -88,6 +92,7 @@ ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTER
 
 ALIAS = {"list": "lista", "ls": "lista", "status": "lista", "estado": "lista",
          "política": "politica", "policy": "politica",
+         "pausa": "pausar", "pause": "pausar", "reanuda": "reanudar", "resume": "reanudar",
          "backup": "respaldar", "restore": "restaurar", "setup": "configurar",
          "help": "ayuda", "-h": "ayuda", "--help": "ayuda"}
 
@@ -236,6 +241,25 @@ def guardar_politicas(regs):
         tmp.replace(POLICY)
     except OSError as e:
         UI.say(WARN, f"No pude guardar {POLICY}: {e}")
+
+
+def pausar(on=True):
+    """Interruptor general de lo que pasa al conectar; dura hasta «movil reanudar»."""
+    try:
+        if on:
+            PAUSA.parent.mkdir(parents=True, exist_ok=True)
+            PAUSA.touch()
+        else:
+            PAUSA.unlink(missing_ok=True)
+    except OSError as e:
+        UI.say(ERR, f"No pude cambiar {PAUSA}: {e}")
+        return 1
+    if on:
+        UI.say(WARN, "En pausa: al conectar un teléfono no pregunta ni respalda, tampoco los de «siempre»")
+        UI.dim("Sigue así, aunque reinicies, hasta «movil reanudar». A mano, «movil» respalda igual")
+    else:
+        UI.say(OK, "Activo: al conectar un teléfono vuelve a preguntar o respaldar")
+    return 0
 
 
 def preguntar(label, last):
@@ -450,6 +474,9 @@ def run_one(kind, ident, label, dev):
 
 
 def respaldar(auto=False):
+    if auto and PAUSA.exists():
+        UI.say(INFO, "En pausa: no se pregunta ni se respalda al conectar (para volver: movil reanudar)")
+        return 0
     held = lock()
     if not held:
         UI.say(WARN, "Ya hay un backup en curso, o un aviso esperando tu respuesta")
@@ -485,6 +512,8 @@ def respaldar(auto=False):
 
 
 def lista():
+    if PAUSA.exists():
+        UI.say(WARN, "En pausa: al conectar no pregunta ni respalda (para volver: movil reanudar)")
     devs = sorted(p for p in ROOT.iterdir() if p.is_dir() and not p.name.startswith("."))
     if not devs:
         UI.say(INFO, "Aún no hay backups. Conecta un teléfono y corre «movil»")
@@ -506,6 +535,8 @@ def lista():
 def politica(name=None, valor=None):
     regs = politicas()
     if name is None:
+        if PAUSA.exists():
+            UI.say(WARN, "En pausa: al conectar no pregunta ni respalda (para volver: movil reanudar)")
         if not regs:
             UI.say(INFO, "Aún no hay dispositivos registrados: aparecen aquí al conectarlos")
             return 0
@@ -648,7 +679,7 @@ def selftest():
     assert ago(90) == "hace 1 min" and dur(75) == "1 min 15 s"
 
     # al conectar: pregunta por defecto, recuerda «siempre»/«nunca», no insiste tras «ahora no»
-    global AUTO_EVERY, POLICY
+    global AUTO_EVERY, POLICY, PAUSA, connected
     AUTO_EVERY, now = 24 * 3600, 2_000_000_000.0
 
     def nadie():
@@ -675,6 +706,14 @@ def selftest():
         assert politica("nadie", "nunca") == 1 and politica("pixel", "quizás") == 2
         POLICY.write_text("{dañado")
         assert politicas() == {}
+        PAUSA = Path(tmp, "otra", "pausa")
+        assert not PAUSA.exists() and pausar() == 0 and PAUSA.exists() and pausar() == 0
+        buscar, connected = connected, lambda wait=0: nadie()   # en pausa no debe ni buscar teléfonos
+        try:
+            assert respaldar(auto=True) == 0
+        finally:
+            connected = buscar
+        assert pausar(False) == 0 and not PAUSA.exists() and pausar(False) == 0
     print("selftest ok")
     return 0
 
@@ -693,6 +732,11 @@ def main(argv):
         return 0
     if cmd == "configurar":
         return configurar()
+    if cmd in ("pausar", "reanudar"):
+        if len(args) != 1:
+            UI.say(ERR, f"Uso: movil {cmd}  (sin más argumentos)")
+            return 2
+        return pausar(cmd == "pausar")
     if cmd == "politica" and len(args) in (1, 3):
         return politica(*args[1:])
     if cmd == "politica":
@@ -711,7 +755,7 @@ def main(argv):
         UI.say(ERR, "Uso: movil restaurar <dispositivo> [snapshot|ultimo]  (nombres en «movil lista»)")
     else:
         UI.say(ERR, f"Comando desconocido: «{args[0]}»")
-        UI.dim("Comandos: lista, politica, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
+        UI.dim("Comandos: lista, politica, pausar, reanudar, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
     return 2
 
 

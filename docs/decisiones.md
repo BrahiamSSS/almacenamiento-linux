@@ -81,3 +81,21 @@ Formato: contexto → decisión → alternativas descartadas → cuándo revisar
   diálogos zenity/kdialog (dependencia nueva).
 - **Simplificación**: tras «Ahora no» no se insiste durante 10 min, por tiempo. Revisar si
   molesta: la alternativa es rastrear la desconexión real con udev.
+- **Interruptor general**: `movil pausar` / `movil reanudar` (archivo `~/.config/movil/pausa`),
+  porque `systemctl mask` no funciona con servicios instalados en `~/.config/systemd/user`.
+  Se descartó mover los servicios a otra carpeta: tocaba timers que ya funcionan. La pausa no
+  caduca sola; a cambio se avisa en `movil lista` y `movil politica`. Revisar si alguien la
+  olvida puesta: la alternativa es una pausa con vencimiento.
+
+## 12. Subir en tandas, despacio, y sin repositorios git
+- **Contexto**: servidor compartido con disco mecánico y muchos servicios. La sincronización
+  horaria de una carpeta con repos (miles de archivos que cambian) y rclone con valores por
+  defecto (4 subidas + 8 comparaciones en paralelo, 3 reintentos de todo) lo saturaban.
+- **Decisión**: excluir los repos (ya están en el servidor git); `docs` cada 3 h con una
+  petición a la vez y velocidad limitada; `datos` en tandas de 30 min cada 2 h, con límite de
+  peticiones por segundo y más lento de día; nunca dos sincronizaciones a la vez; sin
+  reintentos en bloque; `restic prune` semanal.
+- **Por qué tandas por tiempo y no por tamaño**: el costo para Nextcloud depende del número de
+  archivos, no de los bytes; un plazo fijo acota la carga sin importar qué se suba.
+- **Avisos**: solo al segundo fallo seguido; un error suelto se corrige solo en la próxima corrida.
+- **Revisar si**: el servidor pasa a SSD o deja de estar compartido (se puede subir el ritmo).

@@ -76,6 +76,55 @@ gdbus call --session --dest org.freedesktop.Notifications \
 Si el tuyo no las admite, el aviso no tendrá botones y nada se respaldará solo: fija la
 decisión a mano con `movil politica <disp> siempre`.
 
+### Ver qué hizo y cómo detenerlo
+
+`movil-auto.service` no es un programa que se quede corriendo: arranca al conectar un
+teléfono, dura lo que tarde el aviso o el backup, y termina. Por eso **no aparece** en
+`systemctl --user list-units --type=service --state=running`, salvo en ese momento. Está
+instalado igual: se ve con `systemctl --user list-unit-files --type=service`.
+
+| Quiero… | Comando |
+|---|---|
+| Ver su estado y sus últimas líneas | `systemctl --user status movil-auto` |
+| Ver qué hizo las últimas veces | `journalctl --user -u movil-auto -n 30` |
+| Cancelar un aviso o un backup en curso | `systemctl --user stop movil-auto` |
+| Apagarlo para **todos** los teléfonos | `movil pausar` |
+| Volver a encenderlo | `movil reanudar` |
+| Que un teléfono concreto no pregunte ni se respalde | `movil politica <disp> nunca` |
+| Limpiar la marca `failed` | `systemctl --user reset-failed movil-auto` |
+
+Cancelar un backup a medias no daña lo ya guardado: no se crea snapshot y el siguiente
+backup copia lo que faltó.
+
+**La pausa** es el interruptor general. Mientras está puesta, conectar un teléfono no hace
+nada: ni aviso ni backup, tampoco para los que están en `siempre`. Sirve para conectar varios
+teléfonos seguidos, para presentar sin avisos en pantalla o para saltarse un backup.
+
+- Dura hasta `movil reanudar`: **no se quita sola**, ni al reiniciar. Si la olvidas puesta,
+  los teléfonos dejan de respaldarse al conectar. Para que se note, `movil lista` y
+  `movil politica` lo avisan en la primera línea.
+- A mano, `movil` sigue respaldando lo conectado.
+- Es el archivo `~/.config/movil/pausa`: existe = en pausa.
+
+Cómo leer el registro:
+
+| Línea | Significado |
+|---|---|
+| `último backup hace X, se omite` | Hay un backup de menos de 24 h: ni pregunta ni respalda |
+| `ahora no` · `nadie respondió al aviso` | Preguntó y no respaldó |
+| `ya se preguntó hace X, todavía no se insiste` | Pausa de 10 min tras «Ahora no» |
+| `excluido` | El dispositivo está en `nunca` |
+| `En pausa: no se pregunta ni se respalda al conectar` | Está puesta la pausa general |
+| `No hay teléfonos conectados` | Se activó, pero en 30 s no apareció ningún teléfono: se desconectó, está bloqueado o falta tocar «Confiar» |
+| `Ya hay un backup en curso, o un aviso esperando tu respuesta` | Otra ejecución de `movil` tiene el turno |
+
+En los dos últimos casos, y al cancelarlo con `stop`, `status` lo muestra como `failed`.
+No es una avería: la siguiente conexión funciona normal.
+
+`systemctl --user mask movil-auto` **no sirve** para desactivarlo: falla con «File … already
+exists» porque el archivo del servicio vive en `~/.config/systemd/user`, la misma carpeta
+donde systemd pondría el bloqueo. Para eso está `movil pausar`.
+
 ## Restaurar
 
 ```bash

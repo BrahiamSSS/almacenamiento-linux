@@ -2,7 +2,7 @@
 # Backup cifrado y comprimido (restic) del sistema y los teléfonos a un servidor por SFTP.
 # Lee el snapshot btrbk más reciente montado en una ruta fija para que restic
 # reconozca el backup anterior y solo suba cambios.
-#   restic-nube          backup + limpieza según RESTIC_RETENCION (+ check los domingos)
+#   restic-nube          backup + olvido según RESTIC_RETENCION (los domingos: prune y check)
 #   restic-nube init     crea el repositorio
 #   restic-nube cmd ...  cualquier comando restic (snapshots, restore, mount...)
 # Configuración: /etc/almacenamiento.env · contraseña: /etc/restic/password (600)
@@ -28,5 +28,10 @@ shopt -s nullglob
 r backup --compression max --exclude-caches --exclude-file /etc/restic/exclude --tag pc \
     $SRC/root $SRC/home "$MOVIL_DIR"/*/backup-ios
 # shellcheck disable=SC2086  # RESTIC_RETENCION son varias opciones
-r forget $RESTIC_RETENCION --prune
-if [ "$(date +%u)" = 7 ]; then r check --read-data-subset 5%; fi
+r forget $RESTIC_RETENCION
+# Liberar espacio reescribe paquetes en el servidor: solo una vez por semana, y solo si
+# más del 10 % del repositorio es basura.
+if [ "$(date +%u)" = 7 ]; then
+    r prune --max-unused 10%
+    r check --read-data-subset 5%
+fi

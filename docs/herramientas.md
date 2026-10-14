@@ -40,6 +40,7 @@ movil                          respalda todo lo conectado (menos lo excluido)
 movil lista                    dispositivos, último backup, snapshots
 movil politica                 qué pasa al conectar cada dispositivo
 movil politica <disp> preguntar|siempre|nunca
+movil pausar | reanudar        apaga o enciende lo que pasa al conectar, para todos
 movil restaurar <disp> [snap]  devuelve un backup al teléfono
 movil configurar               revisa dependencias y prepara el aviso al conectar
 movil auto                     lo que ejecuta udev al conectar: pregunta con un aviso
@@ -66,22 +67,24 @@ Usa `VM_MONITOR`, `IPHONE_HOSTBUS` e `IPHONE_HOSTPORT`. Para saber bus y puerto:
 ## nube-sync
 
 ```
-nube-sync docs     NUBE_DOCS_LOCAL <-> NUBE_DOCS_REMOTO   (bidireccional, nextcloudcmd)
-nube-sync datos    NUBE_SUBIR y teléfonos -> Nextcloud      (solo subida, rclone copy)
+nube-sync docs     NUBE_DOCS_LOCAL <-> NUBE_DOCS_REMOTO   (bidireccional, nextcloudcmd, despacio)
+nube-sync datos    NUBE_SUBIR y teléfonos -> Nextcloud      (solo subida, rclone copy, en tandas)
 ```
 
 - `docs` sincroniza en ambos sentidos: **borrar en un lado borra en el otro**. La papelera
   de Nextcloud guarda lo borrado unos 30 días.
-- `datos` nunca borra nada, ni local ni remoto: es una copia de respaldo.
-- Si falla, manda una notificación. Timers: `nube-docs.timer` (cada hora) y
-  `nube-datos.timer` (02:00).
+- `datos` nunca borra nada, ni local ni remoto: es una copia de respaldo. Sube como máximo
+  `NUBE_TANDA_MIN` minutos por corrida; la siguiente sigue donde quedó.
+- Ritmo y límites para no saturar el servidor: [nube.md](nube.md#cuidar-el-servidor).
+- `docs` y `datos` nunca corren a la vez. Avisa al segundo fallo seguido (y luego cada 12).
 - Credenciales: `~/.netrc` (para nextcloudcmd) y remoto rclone `NUBE_REMOTO`.
-- Exclusiones de `docs`: `~/.config/nube/exclude.lst`.
+- Exclusiones de `docs`: `~/.config/nube/exclude.lst` (genéricas) y
+  `~/.config/nube/exclude-local.lst` (de esta máquina).
 
 ## restic-nube (root)
 
 ```
-sudo restic-nube                   backup + limpieza (+ verificación parcial los domingos)
+sudo restic-nube                   backup + olvido de snapshots viejos (domingos: prune y check)
 sudo restic-nube init              crea el repositorio en el servidor
 sudo restic-nube cmd snapshots     cualquier comando de restic
 sudo restic-nube cmd restore latest --include <ruta> --target /tmp/r
@@ -114,12 +117,15 @@ sudo env SMARTD_SUBJECT=Prueba SMARTD_MESSAGE=Hola /usr/local/bin/smartd-notify
 | Timer | Tipo | Cuándo |
 |---|---|---|
 | `disk-alert.timer` | usuario | arranque + 10 min, cada 6 h |
-| `nube-docs.timer` | usuario | arranque + 5 min, cada hora |
-| `nube-datos.timer` | usuario | 02:00 |
+| `nube-docs.timer` | usuario | arranque + 15 min, cada 3 h (± 10 min) |
+| `nube-datos.timer` | usuario | arranque + 30 min, cada 2 h (± 10 min), una tanda |
 | `disk-health-dump.timer` | sistema | arranque + 2 min, cada hora |
 | `btrbk.timer` | sistema (paquete btrbk) | 00:00 |
 | `restic-nube.timer` | sistema | 01:00 |
 | `paccache.timer` | sistema (paquete pacman-contrib) | semanal |
 
 Ver estado: `systemctl --user list-timers` y `systemctl list-timers`.
+
+`movil-auto.service` no tiene timer: lo dispara udev al conectar un teléfono. Cómo ver qué
+hizo y cómo detenerlo: [movil.md](movil.md#ver-qué-hizo-y-cómo-detenerlo).
 Los timers de usuario solo corren con la sesión abierta, lo normal en un equipo de escritorio.
