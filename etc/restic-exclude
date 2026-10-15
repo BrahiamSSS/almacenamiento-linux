@@ -4,5 +4,7 @@
 /run/restic-src/home/*/.gradle/caches
 /run/restic-src/home/*/.var/app/*/cache
 /run/restic-src/home/*/.npm
+# Carpeta del cliente de Nextcloud: es una copia de lo que ya está en el servidor.
+/run/restic-src/home/*/Nextcloud
 /run/restic-src/root/var/lib/flatpak
 /run/restic-src/root/var/lib/systemd/coredump

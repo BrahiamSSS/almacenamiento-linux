@@ -36,8 +36,11 @@ Comprime en el cliente lo que sí rinde.
 | Sistema y backups crudos de teléfonos | `restic-nube` → SFTP | solo subida | **sí, en cliente** | no (repositorio aparte) |
 
 Traer al PC: cliente gráfico de Nextcloud, **sincronización selectiva por carpetas**.
-Desmarca la carpeta que ya maneja `nube-sync docs` para no tener dos clientes sobre la
-misma carpeta.
+Desmarca **todo lo que suben `nube-sync docs` y `nube-sync datos`**: ya está en el PC.
+Si lo dejas marcado, el cliente lo vuelve a bajar a su carpeta (por defecto `~/Nextcloud`,
+en el disco del sistema). Eso duplica los datos, carga al servidor con descargas y
+llena el disco. Con `docs`, además, quedan dos clientes bidireccionales sobre la misma
+carpeta. Al desmarcar, el cliente borra solo su copia local; el servidor no cambia.
 
 **No sincronices repositorios git.** Ya tienen su copia en el servidor git; en Nextcloud solo
 suman miles de archivos que cambian a cada rato (y una sincronización bidireccional sobre
@@ -160,6 +163,8 @@ ilegibles.
 | Síntoma | Causa | Solución |
 |---|---|---|
 | Subidas lentísimas con miles de archivos pequeños | Cada archivo son varias consultas a la base de datos; servidor con HDD o compartido | Ver [Cuidar el servidor](#cuidar-el-servidor); excluir repos y carpetas que cambian sin parar |
+| Notificaciones de error constantes del cliente gráfico; su registro dice "The download would reduce free local disk space below the limit" | El cliente intenta bajar al disco del sistema carpetas grandes que ya están en el PC | Desmarcarlas en "Elegir qué sincronizar" (ver [Tres canales](#tres-canales)). Sus registros: `~/.config/Nextcloud/logs/` |
+| restic falla solo cuando lo lanza el timer: `HOME: unbound variable` | Los servicios de root no traen `HOME` y la configuración lo usa | `restic-nube` pone `HOME=/root` si falta (ya incluido) |
 | `nextcloudcmd --exclude` no excluye nada | El archivo no se llama `sync-exclude.lst`, o la ruta empieza con `/` | Ver [Excluir carpetas solo en esta máquina](#excluir-carpetas-solo-en-esta-máquina) |
 | `502 Bad Gateway` | Nextcloud detenido o saturado detrás del proxy | Comprobar el contenedor; las tandas siguientes reintentan solas |
 | El diario solo guarda las últimas horas | Un proceso muy verboso llena el límite del diario | `--silent` / nivel `NOTICE` (ya incluido); ver `journalctl --disk-usage` |

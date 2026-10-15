@@ -7,6 +7,9 @@
 #   restic-nube cmd ...  cualquier comando restic (snapshots, restore, mount...)
 # Configuración: /etc/almacenamiento.env · contraseña: /etc/restic/password (600)
 set -euo pipefail
+# Un servicio de root no trae HOME y la configuración lo usa (rutas de usuario): sin esto,
+# set -u corta el script al leerla.
+export HOME=${HOME:-/root}
 . /etc/almacenamiento.env
 export RESTIC_REPOSITORY="sftp:$SERVIDOR_SSH:$RESTIC_RUTA"
 export RESTIC_PASSWORD_FILE=/etc/restic/password
