@@ -6,6 +6,7 @@ limit=${1:-${ALERTA_UMBRAL:-85}}
 # shellcheck disable=SC2086  # lista de montajes
 df --output=pcent,target ${MONTAJES_VIGILADOS:-/} 2>/dev/null | tail -n +2 | while read -r pct mnt; do
   p=${pct%\%}
-  (( p >= limit )) && notify-send -u critical -i drive-harddisk "Disco casi lleno" "$mnt al $pct"
+  (( p >= limit )) && command -v notify-send >/dev/null 2>&1 && \
+    notify-send -u critical -i drive-harddisk "Disco casi lleno" "$mnt al $pct"
 done
 exit 0

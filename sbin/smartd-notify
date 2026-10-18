@@ -2,6 +2,7 @@
 # smartd lo ejecuta (-M exec) cuando detecta un problema; también lo usa restic-nube-fallo.service.
 # Envía una notificación de escritorio al usuario NOTIFY_UID (/etc/almacenamiento.env, por defecto 1000).
 [ -r /etc/almacenamiento.env ] && . /etc/almacenamiento.env
+command -v notify-send >/dev/null 2>&1 || exit 0  # sin escritorio (p. ej. servidor), no hay nada que notificar
 uid=${NOTIFY_UID:-1000}
 user=$(id -nu "$uid")
 runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus \
