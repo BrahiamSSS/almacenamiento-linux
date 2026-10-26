@@ -97,6 +97,11 @@ def parse(smart):
         written=written,
         unsafe=attrs.get(174, attrs.get(192, {})).get("raw", {}).get("value"),
     )
+    # En algunos discos WD/Toshiba el atributo 192 empaqueta otro dato junto
+    # con el conteo real: sale un número imposible (mucho mayor que los
+    # arranques). Se descarta en vez de mostrarlo.
+    if d["unsafe"] is not None and d["cycles"] and d["unsafe"] > max(d["cycles"] * 50, 1000):
+        d["unsafe"] = None
     for i, name in SATA_ERRORS.items():
         n = attrs.get(i, {}).get("raw", {}).get("value", 0)
         if n:
@@ -132,6 +137,9 @@ def checks(d):
     if d["written"]:
         rows.append((INFO, "Escrito total", tb(d["written"]),
                      "datos escritos en toda su vida", None))
+    elif d["kind"] == "SATA":
+        rows.append((INFO, "Escrito total", "no disponible",
+                     "este disco no expone cuánto se le ha escrito (normal en HDD mecánicos)", None))
     if d["hours"] is not None:
         years = f"{d['hours'] / 8760:.1f}".replace(".", ",")
         rows.append((INFO, "Encendido", f"{num(d['hours'])} h (≈ {years} años)",
@@ -154,7 +162,9 @@ def disks_space():
     res = {}
     for disk in json.loads(out)["blockdevices"]:
         parts = []
-        for p in disk.get("children", []):
+        # Un disco sin tabla de particiones (btrfs/ext4 directo en /dev/sdX) no
+        # tiene "children": lsblk pone montaje y tamaño en el disco mismo.
+        for p in disk.get("children") or [disk]:
             mps = [m for m in p.get("mountpoints") or [] if m and m != "[SWAP]"]
             if mps and p.get("fssize"):
                 mp = "/" if "/" in mps else min(mps, key=len)
@@ -289,6 +299,12 @@ def selftest():
                      {"id": 241, "name": "Total_LBAs_Written", "value": 200,
                       "raw": {"value": 30778250601}}]}})
     assert hdd["written"] == 30778250601 * 512
+    # Caso real: un WD con 33 arranques reportó 115.964.117.019 "apagados
+    # bruscos" (atributo 192 empaquetando otro dato). Debe descartarse.
+    wd = parse({"power_cycle_count": 33, "ata_smart_attributes": {"table": [
+        {"id": 192, "name": "Power-Off_Retract_Count", "value": 100,
+         "raw": {"value": 115964117019}}]}})
+    assert wd["unsafe"] is None
     assert match_disk("/dev/nvme1", ["nvme0n1", "nvme1n1", "sda"]) == "nvme1n1"
     print("selftest ok")
 

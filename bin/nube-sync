@@ -30,7 +30,7 @@ termina() {  # termina CÓDIGO MOTIVO
     local n=$(( $(cat "$ESTADO/fallos-$MODO" 2>/dev/null || echo 0) + 1 ))
     echo "$n" > "$ESTADO/fallos-$MODO"
     echo "Falló ($n seguidas): $2" >&2
-    if [ "$n" -eq 2 ] || [ $(( n % 12 )) -eq 0 ]; then
+    if { [ "$n" -eq 2 ] || [ $(( n % 12 )) -eq 0 ]; } && command -v notify-send >/dev/null 2>&1; then
         notify-send -u critical -i network-error "Nube: «$MODO» falló $n veces seguidas" \
             "$2. Revisa: journalctl --user -u nube-$MODO"
     fi
