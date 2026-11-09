@@ -4,6 +4,7 @@
 Uso: movil [comando] [--plain]
   (sin comando)                   respalda todo lo conectado (menos lo excluido)
   lista (list, estado)            dispositivos, último backup y snapshots
+  progreso                        cómo va el backup en curso y cuánto falta
   politica                        qué pasa al conectar cada dispositivo
   politica <disp> preguntar|siempre|nunca
                                   cambia esa decisión (<disp>: parte del nombre o del id)
@@ -27,6 +28,7 @@ MOVIL_DIR cambia la carpeta raíz; MOVIL_AUTO_HORAS, las 24 h entre backups al c
 Lo que respondes en el aviso se guarda en ~/.config/movil/dispositivos.json;
 la pausa es el archivo ~/.config/movil/pausa.
 """
+import collections
 import contextlib
 import fcntl
 import io
@@ -72,6 +74,15 @@ POLITICAS = {"preguntar": "pregunta antes de respaldar",
              "siempre": "respalda sin preguntar",
              "nunca": "excluido: ni respalda ni pregunta"}
 KEEP_DAYS, KEEP_WEEKS = 7, 4
+# backup en curso, para «movil progreso»
+ESTADO = Path(os.environ.get("XDG_RUNTIME_DIR") or Path.home() / ".cache", "movil.progreso")
+# Barra de idevicebackup2 para la tanda de archivos que está recibiendo: «] 45% (1.2 GB/3.4 GB)».
+# Su otra barra, «] 12% Finished», es el total según el teléfono y no sirve de avance: puede
+# quedarse casi quieta toda la copia y saltar al final.
+LOTE_IOS = re.compile(r"\]\s*(\d+)% \((.+?)/(.+?)\)")
+AVISO_CADA = 25   # % entre un aviso de avance y el siguiente cuando corre solo
+AVISO_MIN = 15    # s que debe llevar un tramo para avisar: las tandas cortas no molestan
+ETA_MIN = 5       # puntos de avance ya medidos antes de atreverse a decir cuánto falta
 UNIT = Path.home() / ".config/systemd/user/movil-auto.service"
 RULE_SRC = Path.home() / ".local/share/movil/90-movil.rules"
 RULE_DST = Path("/etc/udev/rules.d/90-movil.rules")
@@ -92,6 +103,7 @@ ACTION!="remove", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", ENV{ID_USB_INTER
 
 ALIAS = {"list": "lista", "ls": "lista", "status": "lista", "estado": "lista",
          "política": "politica", "policy": "politica",
+         "progress": "progreso", "avance": "progreso",
          "pausa": "pausar", "pause": "pausar", "reanuda": "reanudar", "resume": "reanudar",
          "backup": "respaldar", "restore": "restaurar", "setup": "configurar",
          "help": "ayuda", "-h": "ayuda", "--help": "ayuda"}
@@ -130,11 +142,13 @@ class Out:
         if not self.plain:
             print("\r\033[K", end="", flush=True)
 
-    def notify(self, lvl, title, body=""):
-        if self.notifying and shutil.which("notify-send"):
-            icon = {OK: "phone", WARN: "dialog-warning", ERR: "dialog-error"}.get(lvl, "phone")
-            subprocess.run(["notify-send", "-a", "movil", "-i", icon,
-                            "-u", "critical" if lvl == ERR else "normal", title, body])
+    def notify(self, lvl, title, body="", rid=None):
+        """Aviso de escritorio. Devuelve su id; con rid= actualiza ese aviso en vez de apilar otro."""
+        if not (self.notifying and shutil.which("notify-send")):
+            return None
+        icon = {OK: "phone", WARN: "dialog-warning", ERR: "dialog-error"}.get(lvl, "phone")
+        return out(["notify-send", "-a", "movil", "-i", icon, "-u", "critical" if lvl == ERR else "normal",
+                    "-p", *(["-r", rid] if rid else []), title, body]) or None
 
 
 UI = Out(plain=True)
@@ -164,6 +178,77 @@ def ago(sec):
     if m < 120:
         return f"hace {m} min"
     return f"hace {m // 60} h" if m < 48 * 60 else f"hace {m // 1440} días"
+
+
+# ---------- avance ----------
+
+def falta(base, pct, now):
+    """Segundos que faltan, al ritmo que lleva desde la primera medida `base` = (t, pct).
+    None mientras haya avanzado menos de ETA_MIN puntos: con tan poco, el cálculo no vale nada."""
+    t1, p1 = base
+    return (now - t1) * (100 - pct) / (pct - p1) if pct - p1 >= ETA_MIN else None
+
+
+def barra(pct, eta=None, ancho=24, plain=False, detalle=""):
+    n = int(ancho * pct / 100)
+    lleno, vacio = "#-" if plain else "█░"
+    return " · ".join(filter(None, [f"[{lleno * n}{vacio * (ancho - n)}] {int(pct):3d} %", detalle,
+                                    f"faltan ~{dur(eta)}" if eta is not None else ""]))
+
+
+class Avance:
+    """Cómo va un backup: barra en la terminal, estado para «movil progreso» y,
+    si corre solo, el mismo aviso de escritorio actualizado cada AVISO_CADA %."""
+
+    def __init__(self, label):
+        self.label, self.t0, self.base, self.visto = label, time.time(), None, -1
+        self.nid = UI.notify(INFO, f"Respaldando {label}", "No desconectes el teléfono")
+        self.estado("preparando")
+
+    def estado(self, fase, pct=None, detalle=""):
+        with contextlib.suppress(OSError):   # el avance es un extra: que no tumbe el backup
+            tmp = ESTADO.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"pid": os.getpid(), "nombre": self.label, "inicio": self.t0,
+                                       "fase": fase, "pct": pct, "base": self.base, "detalle": detalle}))
+            tmp.replace(ESTADO)
+
+    def aviso(self, lvl, title, body=""):
+        self.nid = UI.notify(lvl, title, body, rid=self.nid)
+
+    def __call__(self, pct, detalle=""):
+        """Avance (0-100) del tramo que se está copiando. Si retrocede, empezó otro tramo."""
+        now = time.time()
+        if self.base is None or pct < self.visto:
+            self.base, self.visto = (now, pct), -1
+        if int(pct) == self.visto:   # se pinta solo al cambiar el %: llegan cientos de líneas por segundo
+            return
+        # ponytail: ritmo lineal desde que empezó el tramo, y solo de ese tramo (iOS no dice
+        # cuántas tandas faltan). Si el «faltan» engaña, medir el ritmo sobre el último minuto.
+        eta = falta(self.base, pct, now)
+        cruza = pct < 100 and int(pct) // AVISO_CADA > max(self.visto, 0) // AVISO_CADA
+        self.visto = int(pct)
+        UI.progress(barra(pct, eta, detalle=detalle))
+        self.estado("copiando", pct, detalle)
+        if cruza and now - self.base[0] >= AVISO_MIN:
+            if UI.plain:   # sin terminal (journal): una línea por aviso
+                UI.say(INFO, barra(pct, eta, plain=True, detalle=detalle))
+            self.aviso(INFO, f"Respaldando {self.label}", barra(pct, eta, ancho=12, detalle=detalle))
+
+
+def progreso():
+    try:
+        e = json.loads(ESTADO.read_text())
+        os.kill(e["pid"], 0)   # ¿sigue vivo quien lo escribió?
+    except (OSError, ValueError, KeyError, TypeError):
+        UI.say(INFO, "No hay ningún backup en curso")
+        return 1
+    now = time.time()
+    UI.title(e["nombre"])
+    UI.say(INFO, f"{e['fase']}, lleva {dur(now - e['inicio'])}")
+    if e["pct"] is not None:   # el «faltan» se recalcula aquí: si el % se estanca, crece en vez de bajar solo
+        eta = falta(e["base"], e["pct"], now) if e.get("base") else None
+        print("  " + barra(e["pct"], eta, plain=UI.plain, detalle=e.get("detalle", "")))
+    return 0
 
 
 # ---------- dispositivos y snapshots ----------
@@ -341,7 +426,7 @@ def ios_info(udid):
     return label, dev_dir(name, udid)
 
 
-def backup_ios(udid, dev):
+def backup_ios(udid, dev, av):
     if subprocess.run(["idevicepair", "-u", udid, "validate"], capture_output=True).returncode:
         if subprocess.run(["idevicepair", "-u", udid, "pair"], capture_output=True).returncode:
             raise Falla("Desbloquea el teléfono, toca «Confiar» y vuelve a conectarlo")
@@ -351,11 +436,30 @@ def backup_ios(udid, dev):
     (dev / "backup-ios").mkdir(exist_ok=True)
     first = not (dev / "backup-ios" / udid / "Manifest.db").exists()
     UI.say(INFO, "Primer backup: completo, puede tardar bastante" if first else "Backup incremental…")
-    r = subprocess.run(["idevicebackup2", "-u", udid, "backup", str(dev / "backup-ios")],
-                       stdout=subprocess.PIPE if UI.plain else None, stderr=subprocess.STDOUT, text=True)
-    if r.returncode:
-        tail = (r.stdout or "").strip().splitlines()[-3:]
+    tail = collections.deque(maxlen=3)
+    # stdbuf: sin él la salida llega a trozos de 4 KiB y el pedido de código aparece tarde
+    with subprocess.Popen(["stdbuf", "-oL", "idevicebackup2", "-u", udid, "backup", str(dev / "backup-ios")],
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace") as p:
+        pidio = False
+        for line in p.stdout:   # text=True corta también en \r, que es como redibuja sus barras
+            m = LOTE_IOS.search(line)
+            if m:
+                av(int(m[1]), f"{m[2]} de {m[3]}".replace(".", ","))
+            elif "passcode" in line:
+                pidio = True
+                UI.clear()
+                UI.say(WARN, "Escribe el código en el teléfono para que empiece")
+                av.aviso(WARN, f"Respaldando {av.label}", "Escribe el código en el teléfono para que empiece")
+                av.estado("esperando el código en el teléfono")
+            elif pidio:   # siguió hablando: ya le escribieron el código
+                pidio = False
+                av.estado("copiando")
+            elif line.strip() and not line.startswith("["):   # «[» = su barra del total
+                tail.append(line.strip())
+    UI.clear()
+    if p.returncode:
         raise Falla("idevicebackup2 falló" + (": " + " / ".join(tail) if tail else ""))
+    av.estado("armando vista legible")
     n = build_view(dev / "backup-ios" / udid, dev / "archivos")
     return f"{num(n)} archivos legibles"
 
@@ -390,7 +494,7 @@ def android_info(serial):
     return f"{model} (Android {prop('ro.build.version.release') or '?'})", dev_dir(model, serial)
 
 
-def backup_android(serial, dev):
+def backup_android(serial, dev, av):
     adb = ["adb", "-s", serial]
     subvolume(dev)
     base = dev / "archivos"
@@ -413,7 +517,9 @@ def backup_android(serial, dev):
                                  stdout=subprocess.PIPE, text=True)
         pull.stdout.close()
         for i, _ in enumerate(untar.stdout, 1):
-            UI.progress(f"copiando {num(i)}/{num(len(todo))} ({i * 100 // len(todo)} %)")
+            # ponytail: avance por cantidad de archivos, no por bytes: un video grande lo frena.
+            # Si el «faltan» engaña, sumar files[ruta][0] de cada línea de tar.
+            av(i * 100 / len(todo), f"{num(i)}/{num(len(todo))} archivos")
         untar.wait()
         pull.wait()
         UI.clear()
@@ -457,19 +563,21 @@ def lock():
 def run_one(kind, ident, label, dev):
     UI.title(f"{'iOS' if kind == 'ios' else 'Android'}: {label}")
     UI.dim(str(dev))
-    UI.notify(INFO, f"Respaldando {label}", "No desconectes el teléfono")
-    t0 = time.time()
+    av = Avance(label)
     try:
-        summary = (backup_ios if kind == "ios" else backup_android)(ident, dev)
+        summary = (backup_ios if kind == "ios" else backup_android)(ident, dev, av)
         snap = snapshot(dev)
     except (Falla, subprocess.CalledProcessError) as e:
         UI.clear()
         UI.say(ERR, str(e))
-        UI.notify(ERR, f"Backup de {label} falló", str(e))
+        av.aviso(ERR, f"Backup de {label} falló", str(e))
         return False
-    UI.say(OK, f"Listo en {dur(time.time() - t0)}: {summary}")
+    finally:
+        with contextlib.suppress(OSError):
+            ESTADO.unlink(missing_ok=True)
+    UI.say(OK, f"Listo en {dur(time.time() - av.t0)}: {summary}")
     UI.dim(f"snapshot {snap} · {dev / 'archivos'}")
-    UI.notify(OK, f"Backup de {label} listo", f"{summary} en {dur(time.time() - t0)}")
+    av.aviso(OK, f"Backup de {label} listo", f"{summary} en {dur(time.time() - av.t0)}")
     return True
 
 
@@ -678,8 +786,16 @@ def selftest():
     assert min(kept) >= time.strftime(TS, time.localtime(t0 - 35 * 86400))
     assert ago(90) == "hace 1 min" and dur(75) == "1 min 15 s"
 
+    # avance: ritmo desde la primera medida; de idevicebackup2 vale la barra de la tanda, no la del total
+    assert falta((0, 20), 60, 100) == 100 and falta((0, 20), 20, 50) is None
+    assert falta((0, 1), 2, 60) is None                       # 1 punto medido: aún no hay ritmo fiable
+    assert barra(50, 90, ancho=4, plain=True) == "[##--]  50 % · faltan ~1 min 30 s"
+    assert barra(50, ancho=4, plain=True, detalle="1 de 2 GB") == "[##--]  50 % · 1 de 2 GB"
+    assert LOTE_IOS.search("[=====     ]  45% (1.2 MB/3.4 MB)     ").groups() == ("45", "1.2 MB", "3.4 MB")
+    assert not LOTE_IOS.search("[=====     ]  12% Finished")
+
     # al conectar: pregunta por defecto, recuerda «siempre»/«nunca», no insiste tras «ahora no»
-    global AUTO_EVERY, POLICY, PAUSA, connected
+    global AUTO_EVERY, POLICY, PAUSA, ESTADO, connected
     AUTO_EVERY, now = 24 * 3600, 2_000_000_000.0
 
     def nadie():
@@ -714,6 +830,15 @@ def selftest():
         finally:
             connected = buscar
         assert pausar(False) == 0 and not PAUSA.exists() and pausar(False) == 0
+        ESTADO = Path(tmp, "movil.progreso")
+        assert progreso() == 1                                   # nada en curso
+        av = Avance("Pixel 8")
+        av(10)
+        av(40)
+        assert json.loads(ESTADO.read_text())["pct"] == 40 and progreso() == 0
+        t1 = av.base[0]
+        av(3)                                                    # retrocede = otra tanda: ritmo de cero
+        assert av.base[1] == 3 and av.base[0] >= t1 and json.loads(ESTADO.read_text())["pct"] == 3
     print("selftest ok")
     return 0
 
@@ -742,6 +867,8 @@ def main(argv):
     if cmd == "politica":
         UI.say(ERR, "Uso: movil politica [<dispositivo> preguntar|siempre|nunca]")
         return 2
+    if cmd == "progreso":
+        return progreso()
     if not ROOT.is_dir():
         UI.say(ERR, f"Falta {ROOT}. Corre «movil configurar»")
         return 1
@@ -755,7 +882,7 @@ def main(argv):
         UI.say(ERR, "Uso: movil restaurar <dispositivo> [snapshot|ultimo]  (nombres en «movil lista»)")
     else:
         UI.say(ERR, f"Comando desconocido: «{args[0]}»")
-        UI.dim("Comandos: lista, politica, pausar, reanudar, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
+        UI.dim("Comandos: lista, progreso, politica, pausar, reanudar, restaurar, configurar, auto, ayuda (o sin comando para respaldar)")
     return 2
 
 

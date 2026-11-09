@@ -85,6 +85,7 @@ instalado igual: se ve con `systemctl --user list-unit-files --type=service`.
 
 | Quiero… | Comando |
 |---|---|
+| Ver cómo va el backup y cuánto falta | `movil progreso` (en vivo: `watch -n2 movil progreso`) |
 | Ver su estado y sus últimas líneas | `systemctl --user status movil-auto` |
 | Ver qué hizo las últimas veces | `journalctl --user -u movil-auto -n 30` |
 | Cancelar un aviso o un backup en curso | `systemctl --user stop movil-auto` |
@@ -95,6 +96,15 @@ instalado igual: se ve con `systemctl --user list-unit-files --type=service`.
 
 Cancelar un backup a medias no daña lo ya guardado: no se crea snapshot y el siguiente
 backup copia lo que faltó.
+
+**Avance.** Mientras copia, `movil` muestra una barra con el porcentaje y el tiempo que falta:
+en la terminal si lo corres a mano, y en el aviso de escritorio (que se actualiza cada 25 %)
+si arrancó solo al conectar (solo en tramos de más de 15 s). El tiempo es una estimación al
+ritmo que lleva y aparece cuando ya hay algo medido. En iPhone la barra es de la tanda de
+archivos que se está recibiendo (`1,2 GB de 3,4 GB`): el teléfono manda varias y no dice
+cuántas faltan, así que la barra puede volver a empezar; lo normal en un backup incremental
+es una tanda grande y otras que pasan en segundos. Si el iPhone pide el código para empezar,
+el aviso lo dice.
 
 **La pausa** es el interruptor general. Mientras está puesta, conectar un teléfono no hace
 nada: ni aviso ni backup, tampoco para los que están en `siempre`. Sirve para conectar varios
